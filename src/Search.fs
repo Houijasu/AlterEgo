@@ -95,15 +95,18 @@ let ensureHelpers (st: State) =
     else
         for h in st.HelperStates do h.Tt <- st.Tt
 
-// feature kill-switches for ablation testing: ALTEREGO_DISABLE=probcut,singular,corrhist,staged
-let private disabled =
-    match System.Environment.GetEnvironmentVariable "ALTEREGO_DISABLE" with
+// Experimental search features are OPT-IN until individually SPRT-proven:
+// gauntlets measured the batch at -66/-95 Elo vs baseline (2026-06-10).
+// Enable for testing via ALTEREGO_ENABLE=probcut,singular,corrhist,conthist
+let private enabled =
+    match System.Environment.GetEnvironmentVariable "ALTEREGO_ENABLE" with
     | null -> Set.empty
     | s -> s.Split(',') |> Array.map (fun x -> x.Trim().ToLowerInvariant()) |> Set.ofArray
 
-let private useProbcut = not (disabled.Contains "probcut")
-let private useSingular = not (disabled.Contains "singular")
-let private useCorrHist = not (disabled.Contains "corrhist")
+let private useProbcut = enabled.Contains "probcut"
+let private useSingular = enabled.Contains "singular"
+let private useCorrHist = enabled.Contains "corrhist"
+let private useContHist = enabled.Contains "conthist"
 
 // log-based late-move-reduction table
 let private lmrTable =
@@ -137,12 +140,15 @@ let inline private historyIndex (pos: Position) (m: Move) =
 let inline private moveContIdx (pos: Position) (m: Move) =
     pos.Mailbox.[moveFrom m] * 64 + moveTo m
 
-/// combined quiet-move ordering score, capped below killers
+/// combined quiet-move ordering score (capped below killers when contHist is on;
+/// raw main history otherwise — exact baseline ordering parity)
 let inline private quietScore (pos: Position) (st: State) (m: Move) (ply: int) =
-    let h = st.History.[historyIndex pos m]
-    let prev = st.ContIdx.[ply]
-    let c = if prev >= 0 then st.ContHist.[prev * 768 + moveContIdx pos m] else 0
-    min 79_000 (h + c)
+    if not useContHist then st.History.[historyIndex pos m]
+    else
+        let h = st.History.[historyIndex pos m]
+        let prev = st.ContIdx.[ply]
+        let c = if prev >= 0 then st.ContHist.[prev * 768 + moveContIdx pos m] else 0
+        min 79_000 (h + c)
 
 // ---- correction history: static eval bias per (stm, pawn structure) ----
 let inline private corrIndex (pos: Position) =
@@ -310,16 +316,20 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                     if st.Stop.Value then 0
                     elif mcCut <> System.Int32.MinValue then mcCut
                     else
-                        // ---- staged move loop: captures first, quiets generated lazily ----
+                        // ---- move loop: full generation, unified ordering ----
+                        // (staged generation reverted: a quiet TT move emitted late
+                        //  cost -100 Elo; needs a pseudo-legality stage-0 to return)
                         let moves = st.Buffers.[ply]
                         let scores = st.Scores.[ply]
                         let tried = st.TriedQuiets.[ply]
-                        let mutable n = generateCaptures pos moves
+                        let n = generate pos moves
+                        let k0 = st.Killers.[ply * 2]
+                        let k1 = st.Killers.[ply * 2 + 1]
                         for idx in 0 .. n - 1 do
                             let m = moves.[idx]
                             scores.[idx] <-
                                 if m = ttMove then 1_000_000
-                                else
+                                elif isCapture pos m then
                                     let victim =
                                         if moveFlag m = FlagEnPassant then Pawn
                                         else pieceType pos.Mailbox.[moveTo m]
@@ -327,7 +337,10 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                     let mvvLva = victim * 8 - attacker
                                     if seeGe pos m 0 then 100_000 + mvvLva + (if moveFlag m = FlagPromo then 50_000 else 0)
                                     else 70_000 + mvvLva
-                        let mutable quietsAdded = false
+                                elif moveFlag m = FlagPromo then 90_000 + movePromo m
+                                elif m = k0 then 80_000
+                                elif m = k1 then 79_999
+                                else quietScore pos st m ply
                         let futilityOk =
                             not inChk && not isRoot && depth <= 6
                             && not (isMateScore alpha)
@@ -339,29 +352,8 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                         let mutable triedQuiets = 0
                         let mutable i = 0
                         let mutable cut = false
-                        while not cut && (i < n || not quietsAdded) do
-                            if i >= n && not quietsAdded then
-                                // stage 2: append quiets + underpromotions
-                                quietsAdded <- true
-                                let full = st.QuietBuf.[ply]
-                                let nf = generate pos full
-                                let k0 = st.Killers.[ply * 2]
-                                let k1 = st.Killers.[ply * 2 + 1]
-                                for k in 0 .. nf - 1 do
-                                    let q = full.[k]
-                                    let inStage1 =
-                                        (isCapture pos q && moveFlag q <> FlagPromo)
-                                        || (moveFlag q = FlagPromo && movePromo q = Queen)
-                                    if not inStage1 then
-                                        moves.[n] <- q
-                                        scores.[n] <-
-                                            if q = ttMove then 1_000_000
-                                            elif moveFlag q = FlagPromo then -40_000 + movePromo q
-                                            elif q = k0 then 80_000
-                                            elif q = k1 then 79_999
-                                            else quietScore pos st q ply
-                                        n <- n + 1
-                            if i < n then
+                        while not cut && i < n do
+                            if true then
                                 pickNext moves scores i n
                                 let m = moves.[i]
                                 let mScore = scores.[i]
@@ -413,7 +405,7 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                                         st.Killers.[ply * 2 + 1] <- k0
                                                         st.Killers.[ply * 2] <- m
                                                     let bonus = depth * depth
-                                                    let prev = st.ContIdx.[ply]
+                                                    let prev = if useContHist then st.ContIdx.[ply] else -1
                                                     let hIdx = historyIndex pos m
                                                     st.History.[hIdx] <- min 100_000 (st.History.[hIdx] + bonus)
                                                     if prev >= 0 then
