@@ -35,6 +35,9 @@ type Position =
       // NNUE accumulator stack, indexed by Ply (per-Position => thread-safe)
       AccStack: int16[][]
       mutable AccUpdating: bool
+      // set during makeMove when a king move forces a perspective rebuild
+      mutable AccRebuildW: bool
+      mutable AccRebuildB: bool
       // per-game eval override for A/B testing (thread-safe, unlike a global)
       mutable ForcePst: bool }
 
@@ -56,6 +59,8 @@ let create () =
       Ply = 0
       AccStack = Array.init 1024 (fun _ -> Array.zeroCreate<int16> Nnue.AccSize)
       AccUpdating = false
+      AccRebuildW = false
+      AccRebuildB = false
       ForcePst = false }
 
 /// Copy src's full game state into dst (helper threads reuse allocated Positions)
@@ -75,6 +80,8 @@ let copyInto (src: Position) (dst: Position) =
     dst.Phase <- src.Phase
     dst.Ply <- src.Ply
     dst.AccUpdating <- false
+    dst.AccRebuildW <- false
+    dst.AccRebuildB <- false
     dst.ForcePst <- src.ForcePst
     Array.blit src.Undos 0 dst.Undos 0 src.Ply
     if Nnue.active then
@@ -92,7 +99,10 @@ let inline addPiece (pos: Position) (pc: int) (sq: int) =
     pos.Mg <- pos.Mg + Psqt.mg.[pc].[sq]
     pos.Eg <- pos.Eg + Psqt.eg.[pc].[sq]
     pos.Phase <- pos.Phase + Psqt.phase.[pc]
-    if pos.AccUpdating then Nnue.addFeatureTo pos.AccStack.[pos.Ply] pc sq
+    if pos.AccUpdating then
+        let acc = pos.AccStack.[pos.Ply]
+        if not pos.AccRebuildW then Nnue.addFeatureTo acc White pc sq (lsb pos.ByPiece.[King])
+        if not pos.AccRebuildB then Nnue.addFeatureTo acc Black pc sq (lsb pos.ByPiece.[6 + King])
 
 let inline removePiece (pos: Position) (pc: int) (sq: int) =
     let bb = bit sq
@@ -104,7 +114,10 @@ let inline removePiece (pos: Position) (pc: int) (sq: int) =
     pos.Mg <- pos.Mg - Psqt.mg.[pc].[sq]
     pos.Eg <- pos.Eg - Psqt.eg.[pc].[sq]
     pos.Phase <- pos.Phase - Psqt.phase.[pc]
-    if pos.AccUpdating then Nnue.removeFeatureFrom pos.AccStack.[pos.Ply] pc sq
+    if pos.AccUpdating then
+        let acc = pos.AccStack.[pos.Ply]
+        if not pos.AccRebuildW then Nnue.removeFeatureFrom acc White pc sq (lsb pos.ByPiece.[King])
+        if not pos.AccRebuildB then Nnue.removeFeatureFrom acc Black pc sq (lsb pos.ByPiece.[6 + King])
 
 let inline movePiece (pos: Position) (pc: int) (fromSq: int) (toSq: int) =
     let bb = bit fromSq ||| bit toSq
@@ -119,8 +132,14 @@ let inline movePiece (pos: Position) (pc: int) (fromSq: int) (toSq: int) =
     pos.Eg <- pos.Eg + Psqt.eg.[pc].[toSq] - Psqt.eg.[pc].[fromSq]
     if pos.AccUpdating then
         let acc = pos.AccStack.[pos.Ply]
-        Nnue.removeFeatureFrom acc pc fromSq
-        Nnue.addFeatureTo acc pc toSq
+        if not pos.AccRebuildW then
+            let wk = lsb pos.ByPiece.[King]
+            Nnue.removeFeatureFrom acc White pc fromSq wk
+            Nnue.addFeatureTo acc White pc toSq wk
+        if not pos.AccRebuildB then
+            let bk = lsb pos.ByPiece.[6 + King]
+            Nnue.removeFeatureFrom acc Black pc fromSq bk
+            Nnue.addFeatureTo acc Black pc toSq bk
 
 let inline kingSquare (pos: Position) (color: int) =
     lsb pos.ByPiece.[color * 6 + King]
@@ -149,15 +168,18 @@ let castleMask =
     m
 
 let makeMove (pos: Position) (m: Move) =
-    if Nnue.active then
-        Nnue.pushCopy pos.AccStack pos.Ply
-        pos.AccUpdating <- true
     let fromSq = moveFrom m
     let toSq = moveTo m
     let flag = moveFlag m
     let us = pos.Stm
     let them = us ^^^ 1
     let piece = pos.Mailbox.[fromSq]
+    if Nnue.active then
+        Nnue.pushCopy pos.AccStack pos.Ply
+        pos.AccUpdating <- true
+        // a king move can change its perspective's bucket/mirror: rebuild after
+        if Nnue.kingSensitive && pieceType piece = King then
+            if us = White then pos.AccRebuildW <- true else pos.AccRebuildB <- true
     let captured = if flag = FlagEnPassant then them * 6 + Pawn else pos.Mailbox.[toSq]
 
     pos.Undos.[pos.Ply] <-
@@ -204,6 +226,12 @@ let makeMove (pos: Position) (m: Move) =
     if us = Black then pos.Full <- pos.Full + 1
     pos.Stm <- them
     pos.Key <- pos.Key ^^^ Zobrist.side
+    if pos.AccRebuildW then
+        Nnue.rebuildPersp pos.AccStack.[pos.Ply] White pos.ByPiece
+        pos.AccRebuildW <- false
+    if pos.AccRebuildB then
+        Nnue.rebuildPersp pos.AccStack.[pos.Ply] Black pos.ByPiece
+        pos.AccRebuildB <- false
     pos.AccUpdating <- false
 
 let unmakeMove (pos: Position) (m: Move) =

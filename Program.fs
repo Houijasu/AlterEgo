@@ -131,7 +131,10 @@ let private dispatch argv =
             AlterEgo.Datagen.run (int games) (uint64 nodes) out lanes
             0
     | [| "train"; dataFile; epochs; out |] ->
-        AlterEgo.Train.run dataFile (int epochs) out
+        AlterEgo.Train.run dataFile (int epochs) out 4
+        0
+    | [| "train"; dataFile; epochs; out; kb |] ->
+        AlterEgo.Train.run dataFile (int epochs) out (int kb)
         0
     | [| "scrub"; inFile; outFile |] ->
         // Recover a datagen file with interior partial records (killed runs):

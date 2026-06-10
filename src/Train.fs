@@ -16,9 +16,12 @@ open AlterEgo.Types
 [<Literal>]
 let private H = 256      // hidden size (= Nnue.HiddenSize)
 [<Literal>]
-let private In = 768
-[<Literal>]
 let private SampleBytes = 100
+
+// input size is runtime: 768 * kingBuckets (set once by run)
+let mutable private In = 768
+let mutable private buckets = 1
+let mutable private mirror = false
 
 type private Net =
     { W1: float32[]      // In*H, feature-major
@@ -61,9 +64,15 @@ let inline private sigmoidF (x: float32) = 1.0f / (1.0f + exp (-x))
 /// (corrupt/misaligned data must be skipped, never crash the trainer).
 let private extractFeatures (data: byte[]) (off: int) (fs: int[]) (fo: int[]) =
     let stm = int data.[off + 96]
-    if stm > 1 then -1
+    let wKing = BitConverter.ToUInt64(data, off + 5 * 8)
+    let bKing = BitConverter.ToUInt64(data, off + 11 * 8)
+    if stm > 1 || wKing = 0UL || bKing = 0UL then -1
     else
         let opp = stm ^^^ 1
+        let wK = System.Numerics.BitOperations.TrailingZeroCount wKing
+        let bK = System.Numerics.BitOperations.TrailingZeroCount bKing
+        let kStm = if stm = 0 then wK else bK
+        let kOpp = if stm = 0 then bK else wK
         let mutable cnt = 0
         let mutable ok = true
         let mutable pc = 0
@@ -74,8 +83,8 @@ let private extractFeatures (data: byte[]) (off: int) (fs: int[]) (fo: int[]) =
                 bb <- bb &&& (bb - 1UL)
                 if cnt >= 32 then ok <- false
                 else
-                    fs.[cnt] <- AlterEgo.Nnue.featureIndex stm pc sq
-                    fo.[cnt] <- AlterEgo.Nnue.featureIndex opp pc sq
+                    fs.[cnt] <- AlterEgo.Nnue.featureIndexK stm pc sq kStm buckets mirror
+                    fo.[cnt] <- AlterEgo.Nnue.featureIndexK opp pc sq kOpp buckets mirror
                     cnt <- cnt + 1
             pc <- pc + 1
         if ok then cnt else -1
@@ -161,11 +170,18 @@ let private export (net: Net) (path: string) =
         { W1 = Array.map (fun w -> q w qa) net.W1
           B1 = Array.map (fun w -> q w qa) net.B1
           W2 = Array.map (fun w -> q w qb) net.W2
-          B2 = int (round (float (net.B2 * qa * qb))) }
+          B2 = int (round (float (net.B2 * qa * qb)))
+          Buckets = buckets
+          Mirror = mirror }
     AlterEgo.Nnue.save path n
     printfn "exported %s" path
 
-let run (dataPath: string) (epochs: int) (outPath: string) =
+let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
+    buckets <- max 1 (min 4 kingBuckets)
+    mirror <- buckets > 1
+    In <- 768 * buckets
+    printfn "architecture: (%d -> %d)x2 -> 1  (%d king buckets%s)"
+        In H buckets (if mirror then ", mirrored" else "")
     let data = File.ReadAllBytes dataPath
     let total = data.Length / SampleBytes
     let valCount = max 1 (total / 100)

@@ -1,20 +1,24 @@
 module AlterEgo.Nnue
 
-// NNUE evaluation, architecture (768 -> 256)x2 -> 1 with ClippedReLU.
-// Feature: piece (12) x square (64), perspective-relative (black mirrors color+rank).
-// Quantization: W1/B1 scaled by QA, W2 scaled by QB, B2 by QA*QB; cp = raw * Scale / (QA*QB).
+// NNUE evaluation: (768*K -> 256)x2 -> 1 with ClippedReLU, K = king buckets.
 //
-// THREAD-SAFE BY DESIGN: this module holds no mutable evaluation state. Every
-// function operates on caller-owned accumulator arrays (Position carries an
-// accumulator stack indexed by its ply). The only globals are the loaded
-// network (written once at load, read-only afterwards) and the `active` flag.
+// Features are perspective-relative (black mirrors color+rank) and, for K > 1,
+// conditioned on the perspective's OWN king: 4 king-zone buckets + horizontal
+// mirroring (own king on files e-h flips the board for that perspective).
+// A king move that changes bucket/mirror state rebuilds that perspective's
+// accumulator; all other moves update incrementally. Unmake is a stack pop.
+//
+// File format: magic, inputSize, hiddenSize, B1, W1, W2, B2 (little-endian
+// int16/int32). King buckets are derived from inputSize (768*K) — the same
+// loader reads both legacy 768 nets and bucketed nets.
+//
+// THREAD-SAFE BY DESIGN: no mutable evaluation state in this module; every
+// function operates on caller-owned accumulators (Position carries the stack).
 
 open System.IO
 open System.Numerics
 open AlterEgo.Types
 
-[<Literal>]
-let InputSize = 768
 [<Literal>]
 let HiddenSize = 256
 [<Literal>]
@@ -27,35 +31,64 @@ let QB = 64
 let Scale = 400
 [<Literal>]
 let Magic = 0x4E4E4541   // "AENN" little-endian
+[<Literal>]
+let MaxBuckets = 4
 
 type Network =
     { W1: int16[]   // [InputSize * HiddenSize], feature-major
       B1: int16[]   // [HiddenSize]
       W2: int16[]   // [2 * HiddenSize]: side-to-move half, then opponent half
-      B2: int32 }
+      B2: int32
+      Buckets: int  // 1 (legacy 768) or 4 (king-bucketed, with mirroring)
+      Mirror: bool }
 
 let mutable net: Network option = None
 
 /// true once a network is loaded — Positions maintain their accumulator stacks
 let mutable active = false
 
-let private readNet (br: BinaryReader) : bool =
-    if br.ReadInt32() <> Magic then false
-    elif br.ReadInt32() <> InputSize || br.ReadInt32() <> HiddenSize then false
-    else
-        let b1 = Array.init HiddenSize (fun _ -> br.ReadInt16())
-        let w1 = Array.init (InputSize * HiddenSize) (fun _ -> br.ReadInt16())
-        let w2 = Array.init (2 * HiddenSize) (fun _ -> br.ReadInt16())
-        let b2 = br.ReadInt32()
-        net <- Some { W1 = w1; B1 = b1; W2 = w2; B2 = b2 }
-        active <- true
-        true
+/// true when king moves require an accumulator rebuild (bucketed nets)
+let mutable kingSensitive = false
+
+// king-zone buckets, indexed by own-perspective king square AFTER mirroring
+// (king always on files a-d here): castled-zone splits on ranks 1-2, then bands
+let private bucketTable =
+    Array.init 64 (fun sq ->
+        let r = sq >>> 3
+        let f = sq &&& 7
+        if r <= 1 then (if f < 2 then 0 else 1)
+        elif r <= 3 then 2
+        else 3)
 
 let load (path: string) : bool =
     try
         use br = new BinaryReader(File.OpenRead path)
-        readNet br
+        if br.ReadInt32() <> Magic then false
+        else
+            let inp = br.ReadInt32()
+            let hid = br.ReadInt32()
+            if hid <> HiddenSize || inp % 768 <> 0 || inp / 768 < 1 || inp / 768 > MaxBuckets then false
+            else
+                let b1 = Array.init HiddenSize (fun _ -> br.ReadInt16())
+                let w1 = Array.init (inp * HiddenSize) (fun _ -> br.ReadInt16())
+                let w2 = Array.init (2 * HiddenSize) (fun _ -> br.ReadInt16())
+                let b2 = br.ReadInt32()
+                let buckets = inp / 768
+                net <- Some { W1 = w1; B1 = b1; W2 = w2; B2 = b2; Buckets = buckets; Mirror = buckets > 1 }
+                active <- true
+                kingSensitive <- buckets > 1
+                true
     with _ -> false
+
+let save (path: string) (n: Network) =
+    use bw = new BinaryWriter(File.Create path)
+    bw.Write Magic
+    bw.Write (n.Buckets * 768)
+    bw.Write HiddenSize
+    for v in n.B1 do bw.Write v
+    for v in n.W1 do bw.Write v
+    for v in n.W2 do bw.Write v
+    bw.Write n.B2
 
 /// Load the network embedded in the executable (the zero-configuration default)
 let loadEmbedded () : bool =
@@ -65,23 +98,35 @@ let loadEmbedded () : bool =
         if isNull s then false
         else
             use br = new BinaryReader(s)
-            readNet br
+            if br.ReadInt32() <> Magic then false
+            else
+                let inp = br.ReadInt32()
+                let hid = br.ReadInt32()
+                if hid <> HiddenSize || inp % 768 <> 0 || inp / 768 < 1 || inp / 768 > MaxBuckets then false
+                else
+                    let b1 = Array.init HiddenSize (fun _ -> br.ReadInt16())
+                    let w1 = Array.init (inp * HiddenSize) (fun _ -> br.ReadInt16())
+                    let w2 = Array.init (2 * HiddenSize) (fun _ -> br.ReadInt16())
+                    let b2 = br.ReadInt32()
+                    let buckets = inp / 768
+                    net <- Some { W1 = w1; B1 = b1; W2 = w2; B2 = b2; Buckets = buckets; Mirror = buckets > 1 }
+                    active <- true
+                    kingSensitive <- buckets > 1
+                    true
     with _ -> false
 
-let save (path: string) (n: Network) =
-    use bw = new BinaryWriter(File.Create path)
-    bw.Write Magic
-    bw.Write InputSize
-    bw.Write HiddenSize
-    for v in n.B1 do bw.Write v
-    for v in n.W1 do bw.Write v
-    for v in n.W2 do bw.Write v
-    bw.Write n.B2
-
-/// Feature index of piece pc (0..11) on sq, from `persp`'s point of view
-let inline featureIndex (persp: int) (pc: int) (sq: int) =
-    if persp = White then pc * 64 + sq
-    else (if pc < 6 then pc + 6 else pc - 6) * 64 + (sq ^^^ 56)
+/// Feature index of piece pc (0..11) on sq, from `persp`'s point of view,
+/// given that perspective's own (raw, unoriented) king square.
+let featureIndexK (persp: int) (pc: int) (sq: int) (kingSq: int) (buckets: int) (mir: bool) =
+    let mutable oSq = if persp = White then sq else sq ^^^ 56
+    let oPc = if persp = White then pc else (if pc < 6 then pc + 6 else pc - 6)
+    if buckets <= 1 then oPc * 64 + oSq
+    else
+        let mutable oK = if persp = White then kingSq else kingSq ^^^ 56
+        if mir && (oK &&& 7) >= 4 then
+            oSq <- oSq ^^^ 7
+            oK <- oK ^^^ 7
+        (bucketTable.[oK] * 12 + oPc) * 64 + oSq
 
 let inline private addColumn (acc: int16[]) (accOff: int) (w: int16[]) (wOff: int) =
     let vc = Vector<int16>.Count
@@ -105,36 +150,41 @@ let inline private subColumn (acc: int16[]) (accOff: int) (w: int16[]) (wOff: in
 let inline pushCopy (stack: int16[][]) (ply: int) =
     System.Array.Copy(stack.[ply], stack.[ply + 1], AccSize)
 
-/// apply "piece pc appears on sq" to both perspectives of acc
-let addFeatureTo (acc: int16[]) (pc: int) (sq: int) =
+/// apply "piece pc appears on sq" to ONE perspective of acc
+let addFeatureTo (acc: int16[]) (persp: int) (pc: int) (sq: int) (kingSq: int) =
     match net with
     | Some n ->
-        addColumn acc 0 n.W1 (featureIndex White pc sq * HiddenSize)
-        addColumn acc HiddenSize n.W1 (featureIndex Black pc sq * HiddenSize)
+        let off = if persp = White then 0 else HiddenSize
+        addColumn acc off n.W1 (featureIndexK persp pc sq kingSq n.Buckets n.Mirror * HiddenSize)
     | None -> ()
 
-let removeFeatureFrom (acc: int16[]) (pc: int) (sq: int) =
+let removeFeatureFrom (acc: int16[]) (persp: int) (pc: int) (sq: int) (kingSq: int) =
     match net with
     | Some n ->
-        subColumn acc 0 n.W1 (featureIndex White pc sq * HiddenSize)
-        subColumn acc HiddenSize n.W1 (featureIndex Black pc sq * HiddenSize)
+        let off = if persp = White then 0 else HiddenSize
+        subColumn acc off n.W1 (featureIndexK persp pc sq kingSq n.Buckets n.Mirror * HiddenSize)
     | None -> ()
 
-/// rebuild acc from raw piece bitboards (setFen / verification)
-let buildInto (acc: int16[]) (byPiece: uint64[]) =
+/// rebuild ONE perspective of acc from raw piece bitboards
+let rebuildPersp (acc: int16[]) (persp: int) (byPiece: uint64[]) =
     match net with
     | Some n ->
+        let off = if persp = White then 0 else HiddenSize
+        let kSq = BitOperations.TrailingZeroCount byPiece.[persp * 6 + King]
         for j in 0 .. HiddenSize - 1 do
-            acc.[j] <- n.B1.[j]
-            acc.[HiddenSize + j] <- n.B1.[j]
+            acc.[off + j] <- n.B1.[j]
         for pc in 0 .. 11 do
             let mutable bb = byPiece.[pc]
             while bb <> 0UL do
                 let sq = BitOperations.TrailingZeroCount bb
                 bb <- bb &&& (bb - 1UL)
-                addColumn acc 0 n.W1 (featureIndex White pc sq * HiddenSize)
-                addColumn acc HiddenSize n.W1 (featureIndex Black pc sq * HiddenSize)
+                addColumn acc off n.W1 (featureIndexK persp pc sq kSq n.Buckets n.Mirror * HiddenSize)
     | None -> ()
+
+/// rebuild both perspectives (setFen / verification)
+let buildInto (acc: int16[]) (byPiece: uint64[]) =
+    rebuildPersp acc White byPiece
+    rebuildPersp acc Black byPiece
 
 /// clamp to [0, QA], widening int16 -> int32 dot product (SIMD)
 let private dotHalf (acc: int16[]) (accOff: int) (w2: int16[]) (w2Off: int) =
