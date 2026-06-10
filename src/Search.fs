@@ -95,16 +95,20 @@ let ensureHelpers (st: State) =
     else
         for h in st.HelperStates do h.Tt <- st.Tt
 
-// Experimental search features are OPT-IN until individually SPRT-proven:
-// gauntlets measured the batch at -66/-95 Elo vs baseline (2026-06-10).
-// Enable for testing via ALTEREGO_ENABLE=probcut,singular,corrhist,conthist
-let private enabled =
-    match System.Environment.GetEnvironmentVariable "ALTEREGO_ENABLE" with
+// Search features ship default-on only once individually SPRT-proven.
+// Promoted: singular (+38 Elo @128 games, tuned margins, 2026-06-10).
+// Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist.
+// Promoted features can be switched off via ALTEREGO_DISABLE for A/B runs.
+let private parseSet (envVar: string) =
+    match System.Environment.GetEnvironmentVariable envVar with
     | null -> Set.empty
     | s -> s.Split(',') |> Array.map (fun x -> x.Trim().ToLowerInvariant()) |> Set.ofArray
 
+let private enabled = parseSet "ALTEREGO_ENABLE"
+let private disabled = parseSet "ALTEREGO_DISABLE"
+
 let private useProbcut = enabled.Contains "probcut"
-let private useSingular = enabled.Contains "singular"
+let private useSingular = not (disabled.Contains "singular")
 let private useCorrHist = enabled.Contains "corrhist"
 let private useContHist = enabled.Contains "conthist"
 
@@ -125,8 +129,8 @@ let private tune =
 
 let private tuned key dflt = tune |> Map.tryFind key |> Option.defaultValue dflt
 
-let private sBetaMult = tuned "sbetamult" 2     // singular margin: ttScore - mult*depth
-let private sDepthGate = tuned "sdepth" 8       // singular minimum depth
+let private sBetaMult = tuned "sbetamult" 3     // singular margin: ttScore - mult*depth (3 = SPRT winner)
+let private sDepthGate = tuned "sdepth" 6       // singular minimum depth (6 = SPRT winner)
 let private corrDiv = tuned "corrdiv" 16        // correction strength divisor
 let private corrW = tuned "corrw" 16            // correction update weight cap
 let private pcMargin = tuned "pcmargin" 160     // probcut beta margin

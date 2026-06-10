@@ -22,3 +22,11 @@ Caveats: SF's UCI_Elo calibration assumes its own conditions; 16-game rungs are
 coarse (±~100); full-strength SF18 (no limiter) remains far beyond the scale top.
 
 Distance to goal: full Stockfish ≈ 3640+ CCRL ⇒ ~900+ Elo to close.
+
+## Anchor 2 — 2026-06-10 (net7 promoted)
+
+net7 (king-bucketed, 10.7M samples) beat net4 **+60 Elo over 64 games**
+(direct same-binary A/B — the precise instrument for deltas). SF rungs with
+net7: 71.9% @2600, 15.6% @2900, 15.6% @3190 — scatter ±150 at 16-game
+resolution; absolute anchor unchanged within error: **≈2760 ± 100**.
+Ladder rungs need 64 games each to resolve deltas under ~100 Elo.
