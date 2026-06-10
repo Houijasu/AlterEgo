@@ -1,0 +1,60 @@
+module AlterEgo.UciEngine
+
+// UCI client for external engines (M7 cage matches): spawns the engine process,
+// handles the handshake, and exchanges position/go/bestmove.
+
+open System
+open System.Diagnostics
+
+type Engine(path: string, options: (string * string) list) =
+    let psi = ProcessStartInfo(path)
+    do
+        psi.RedirectStandardInput <- true
+        psi.RedirectStandardOutput <- true
+        psi.RedirectStandardError <- true
+        psi.UseShellExecute <- false
+        psi.CreateNoWindow <- true
+    let proc = Process.Start psi
+
+    let send (s: string) =
+        proc.StandardInput.WriteLine s
+        proc.StandardInput.Flush()
+
+    let rec waitFor (prefix: string) =
+        let line = proc.StandardOutput.ReadLine()
+        if line = null then failwithf "engine %s terminated unexpectedly" path
+        elif line.StartsWith prefix then line
+        else waitFor prefix
+
+    do
+        send "uci"
+        waitFor "uciok" |> ignore
+        for (n, v) in options do
+            send (sprintf "setoption name %s value %s" n v)
+        send "isready"
+        waitFor "readyok" |> ignore
+
+    member _.Name = path
+
+    member _.NewGame() =
+        send "ucinewgame"
+        send "isready"
+        waitFor "readyok" |> ignore
+
+    /// moves: space-separated UCI moves from startpos ("" for the initial position)
+    member _.BestMove(moves: string, moveMs: int64) =
+        send (if moves = "" then "position startpos" else "position startpos moves " + moves)
+        send (sprintf "go movetime %d" moveMs)
+        let line = waitFor "bestmove"
+        let parts = line.Split(' ')
+        if parts.Length >= 2 then parts.[1] else "0000"
+
+    member _.Quit() =
+        try
+            send "quit"
+            if not (proc.WaitForExit 2000) then proc.Kill()
+        with _ ->
+            (try proc.Kill() with _ -> ())
+
+    interface IDisposable with
+        member this.Dispose() = this.Quit()

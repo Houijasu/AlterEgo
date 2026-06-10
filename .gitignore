@@ -1,0 +1,10 @@
+# build outputs
+bin/
+obj/
+
+# training data, generated nets and experiment artifacts (large / reproducible)
+data/
+*.log
+
+# external engines
+tools/

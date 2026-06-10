@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TieredCompilation>false</TieredCompilation>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="default.nnue">
+      <LogicalName>AlterEgo.DefaultNet</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="src\Types.fs" />
+    <Compile Include="src\Bitboards.fs" />
+    <Compile Include="src\Magics.fs" />
+    <Compile Include="src\Zobrist.fs" />
+    <Compile Include="src\Psqt.fs" />
+    <Compile Include="src\Nnue.fs" />
+    <Compile Include="src\Position.fs" />
+    <Compile Include="src\MoveGen.fs" />
+    <Compile Include="src\Perft.fs" />
+    <Compile Include="src\Eval.fs" />
+    <Compile Include="src\TT.fs" />
+    <Compile Include="src\Search.fs" />
+    <Compile Include="src\Machine.fs" />
+    <Compile Include="src\UciEngine.fs" />
+    <Compile Include="src\Arena.fs" />
+    <Compile Include="src\Datagen.fs" />
+    <Compile Include="src\Train.fs" />
+    <Compile Include="src\Uci.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+</Project>
