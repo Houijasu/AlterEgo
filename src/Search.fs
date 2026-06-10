@@ -108,6 +108,30 @@ let private useSingular = enabled.Contains "singular"
 let private useCorrHist = enabled.Contains "corrhist"
 let private useContHist = enabled.Contains "conthist"
 
+// margin knobs for tuning sweeps: ALTEREGO_TUNE=sbetamult=3,corrdiv=32,pcmargin=200
+let private tune =
+    match System.Environment.GetEnvironmentVariable "ALTEREGO_TUNE" with
+    | null -> Map.empty
+    | s ->
+        s.Split(',')
+        |> Array.choose (fun kv ->
+            match kv.Split('=') with
+            | [| k; v |] ->
+                match System.Int32.TryParse(v.Trim()) with
+                | true, n -> Some (k.Trim().ToLowerInvariant(), n)
+                | _ -> None
+            | _ -> None)
+        |> Map.ofArray
+
+let private tuned key dflt = tune |> Map.tryFind key |> Option.defaultValue dflt
+
+let private sBetaMult = tuned "sbetamult" 2     // singular margin: ttScore - mult*depth
+let private sDepthGate = tuned "sdepth" 8       // singular minimum depth
+let private corrDiv = tuned "corrdiv" 16        // correction strength divisor
+let private corrW = tuned "corrw" 16            // correction update weight cap
+let private pcMargin = tuned "pcmargin" 160     // probcut beta margin
+let private pcDepthGate = tuned "pcdepth" 5     // probcut minimum depth
+
 // log-based late-move-reduction table
 let private lmrTable =
     Array2D.init 64 64 (fun d m ->
@@ -158,7 +182,7 @@ let inline private correctedEval (pos: Position) (st: State) (raw: int) =
     if not useCorrHist then raw
     else
         let bound = MateValue - 2 * MaxPly
-        let c = raw + st.CorrHist.[corrIndex pos] / 16
+        let c = raw + st.CorrHist.[corrIndex pos] / corrDiv
         if c > bound then bound elif c < -bound then -bound else c
 
 let inline private pickNext (moves: Move[]) (scores: int[]) (i: int) (n: int) =
@@ -277,10 +301,10 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                         earlyCut <- if isMateScore v then beta else v
                 // probcut: a good capture beating beta by a margin at reduced depth
                 if useProbcut && earlyCut = System.Int32.MinValue
-                   && not isRoot && excluded = NoMove && not inChk && depth >= 5
+                   && not isRoot && excluded = NoMove && not inChk && depth >= pcDepthGate
                    && not (isMateScore beta)
-                   && not (tte.Hit && tte.Depth >= depth - 3 && scoreFromTt tte.Score ply < beta + 160) then
-                    let probCutBeta = beta + 160
+                   && not (tte.Hit && tte.Depth >= depth - 3 && scoreFromTt tte.Score ply < beta + pcMargin) then
+                    let probCutBeta = beta + pcMargin
                     let pcMoves = st.QuietBuf.[ply]
                     let pn = generateCaptures pos pcMoves
                     let mutable pi = 0
@@ -305,10 +329,10 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                     // singular extension / multicut via exclusion search
                     let mutable singularExt = 0
                     let mutable mcCut = System.Int32.MinValue
-                    if useSingular && not isRoot && excluded = NoMove && depth >= 8
+                    if useSingular && not isRoot && excluded = NoMove && depth >= sDepthGate
                        && ttMove <> NoMove && tte.Hit && tte.Depth >= depth - 3
                        && tte.Bound <> BoundUpper && not (isMateScore tte.Score) then
-                        let sBeta = scoreFromTt tte.Score ply - 2 * depth
+                        let sBeta = scoreFromTt tte.Score ply - sBetaMult * depth
                         let v = searchEx pos st ((depth - 1) / 2) ply (sBeta - 1) sBeta false ttMove
                         if not st.Stop.Value then
                             if v < sBeta then singularExt <- 1          // TT move is singular: extend
@@ -435,7 +459,7 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                    && not (bound = BoundUpper && best >= rawEval) then
                                     let ci = corrIndex pos
                                     let diff = best - rawEval
-                                    let w = min (depth + 1) 16
+                                    let w = min (depth + 1) corrW
                                     let e = st.CorrHist.[ci]
                                     let nv = (e * (64 - w) + diff * 16 * w) / 64
                                     st.CorrHist.[ci] <- max -4096 (min 4096 nv)

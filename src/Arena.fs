@@ -22,20 +22,30 @@ type GameResult =
 
 /// GSPRT log-likelihood ratio for H1: elo=elo1 vs H0: elo=elo0 (trinomial,
 /// draw ratio fixed at the observed value). Bounds for alpha=beta=0.05: +/-2.94.
+/// +0.5 pseudo-counts keep shutout results informative instead of returning 0.
 let sprtLlr (wins: int) (draws: int) (losses: int) (elo0: float) (elo1: float) =
     let n = wins + draws + losses
-    if n = 0 || wins = 0 || losses = 0 then 0.0
+    if n = 0 then 0.0
     else
-        let dr = float draws / float n
+        let w = float wins + 0.5
+        let l = float losses + 0.5
+        let d = float draws
+        let total = w + l + d
+        let dr = d / total
         let expScore e = 1.0 / (1.0 + 10.0 ** (-e / 400.0))
         let probs e =
             let p = expScore e
-            let w = max 1e-9 (p - dr / 2.0)
-            let l = max 1e-9 (1.0 - p - dr / 2.0)
-            w, l
+            let pw = max 1e-9 (p - dr / 2.0)
+            let pl = max 1e-9 (1.0 - p - dr / 2.0)
+            pw, pl
         let w0, l0 = probs elo0
         let w1, l1 = probs elo1
-        float wins * log (w1 / w0) + float losses * log (l1 / l0)
+        w * log (w1 / w0) + l * log (l1 / l0)
+
+[<Literal>]
+let SprtUpper = 2.94    // accept H1 (alpha = 0.05)
+[<Literal>]
+let SprtLower = -2.94   // accept H0 (beta = 0.05)
 
 // short, balanced opening lines (UCI moves from startpos)
 let private openings =
@@ -180,6 +190,7 @@ let runGauntlet (extPath: string) (extOptions: (string * string) list)
     let sync = obj ()
     let nextGame = [| -1 |]
     let tally = [| 0; 0; 0 |]   // wins, draws, losses
+    let earlyStop = [| false |]
     let mutable score = 0.0
     printfn "cage: AlterEgo%s vs %s — %d games at %dms/move, %d lanes"
         (if useMachine then "(MACHINE)" else "") extPath games moveMs lanes
@@ -188,7 +199,7 @@ let runGauntlet (extPath: string) (extOptions: (string * string) list)
             use ext = new AlterEgo.UciEngine.Engine(extPath, extOptions)
             let st = createState ttMb
             let mutable g = System.Threading.Interlocked.Increment(&nextGame.[0])
-            while g < games do
+            while g < games && not (System.Threading.Volatile.Read(&earlyStop.[0])) do
                 let opening = openings.[(g / 2) % openings.Length]
                 let weAreWhite = g % 2 = 0
                 st.Tt.Clear()
@@ -198,10 +209,13 @@ let runGauntlet (extPath: string) (extOptions: (string * string) list)
                     if pts > 0.75 then tally.[0] <- tally.[0] + 1
                     elif pts > 0.25 then tally.[1] <- tally.[1] + 1
                     else tally.[2] <- tally.[2] + 1
-                    printfn "game %2d  [AlterEgo as %s]  %s   +%d =%d -%d"
+                    let llr = sprtLlr tally.[0] tally.[1] tally.[2] 0.0 5.0
+                    printfn "game %2d  [AlterEgo as %s]  %s   +%d =%d -%d  LLR %+.2f"
                         (g + 1) (if weAreWhite then "W" else "B")
                         (if pts > 0.75 then "WIN" elif pts > 0.25 then "draw" else "loss")
-                        tally.[0] tally.[1] tally.[2])
+                        tally.[0] tally.[1] tally.[2] llr
+                    if llr >= SprtUpper || llr <= SprtLower then
+                        System.Threading.Volatile.Write(&earlyStop.[0], true))
                 g <- System.Threading.Interlocked.Increment(&nextGame.[0])
         with ex -> logCrash "gauntlet lane" ex
     let threads =
@@ -212,14 +226,20 @@ let runGauntlet (extPath: string) (extOptions: (string * string) list)
              t |]
     worker ()
     for t in threads do t.Join()
-    let pct = score / float games
+    let played = tally.[0] + tally.[1] + tally.[2]
+    let pct = if played = 0 then 0.5 else score / float played
     let eloDiff =
         if pct <= 0.0 then -999.0
         elif pct >= 1.0 then 999.0
         else -400.0 * log10 (1.0 / pct - 1.0)
+    let llr = sprtLlr tally.[0] tally.[1] tally.[2] 0.0 5.0
+    let verdict =
+        if llr >= SprtUpper then "H1 accepted (stronger)"
+        elif llr <= SprtLower then "H0 accepted (not stronger)"
+        else "inconclusive"
     printfn ""
-    printfn "cage result: +%d =%d -%d  score %.1f%%  elo %+.0f vs opponent"
-        tally.[0] tally.[1] tally.[2] (pct * 100.0) eloDiff
+    printfn "cage result: +%d =%d -%d (%d games)  score %.1f%%  elo %+.0f  LLR %+.2f [%s]"
+        tally.[0] tally.[1] tally.[2] played (pct * 100.0) eloDiff llr verdict
 
 /// Run a match: `kindA` vs `kindB`, alternating colors across the opening set.
 /// `lanes` games run concurrently, each lane with its own pair of states.
@@ -227,6 +247,7 @@ let runMatch (kindA: PlayerKind) (kindB: PlayerKind) (games: int) (moveMs: int64
     let lanes = max 1 (min lanes games)
     let sync = obj ()
     let nextGame = [| -1 |]
+    let earlyStop = [| false |]
     let mutable winsA = 0
     let mutable winsB = 0
     let mutable draws = 0
@@ -237,7 +258,7 @@ let runMatch (kindA: PlayerKind) (kindB: PlayerKind) (games: int) (moveMs: int64
             let stA = createState ttMb
             let stB = createState ttMb
             let mutable g = System.Threading.Interlocked.Increment(&nextGame.[0])
-            while g < games do
+            while g < games && not (System.Threading.Volatile.Read(&earlyStop.[0])) do
                 let opening = openings.[(g / 2) % openings.Length]
                 let aIsWhite = g % 2 = 0
                 stA.Tt.Clear()
@@ -251,8 +272,11 @@ let runMatch (kindA: PlayerKind) (kindB: PlayerKind) (games: int) (moveMs: int64
                         | WhiteWins, true | BlackWins, false -> winsA <- winsA + 1; "1-0 (A)"
                         | WhiteWins, false | BlackWins, true -> winsB <- winsB + 1; "0-1 (B)"
                         | Draw, _ -> draws <- draws + 1; "1/2"
-                    printfn "game %2d  [%s as %s]  %s   +%d =%d -%d"
-                        (g + 1) (nameOf kindA) (if aIsWhite then "W" else "B") aPoint winsA draws winsB)
+                    let llr = sprtLlr winsA draws winsB 0.0 5.0
+                    printfn "game %2d  [%s as %s]  %s   +%d =%d -%d  LLR %+.2f"
+                        (g + 1) (nameOf kindA) (if aIsWhite then "W" else "B") aPoint winsA draws winsB llr
+                    if llr >= SprtUpper || llr <= SprtLower then
+                        System.Threading.Volatile.Write(&earlyStop.[0], true))
                 g <- System.Threading.Interlocked.Increment(&nextGame.[0])
         with ex -> logCrash "match lane" ex
     let threads =
