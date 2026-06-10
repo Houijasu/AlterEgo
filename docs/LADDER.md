@@ -30,3 +30,9 @@ net7 (king-bucketed, 10.7M samples) beat net4 **+60 Elo over 64 games**
 net7: 71.9% @2600, 15.6% @2900, 15.6% @3190 — scatter ±150 at 16-game
 resolution; absolute anchor unchanged within error: **≈2760 ± 100**.
 Ladder rungs need 64 games each to resolve deltas under ~100 Elo.
+
+## Anchor 3 — 2026-06-10 (net7 + singular extensions promoted)
+
+Promoted package (commit `41a8745`): 78.1% @2600 (~2821), 15.6% @2900 (~2607).
+Direct A/B evidence behind the package: net7 +60 (64g), singular +38 (128g).
+Absolute anchor: **≈2760–2820 ± 100** at 16-game rung resolution.
