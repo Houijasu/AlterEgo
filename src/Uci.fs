@@ -62,7 +62,6 @@ let run () =
             printfn "info string NNUE: no embedded network — PST evaluation"
     let pos = fromFen StartFen
     let mutable st = createState 64
-    let mutable machineOn = false
     let mutable worker: Thread = null
 
     let stopSearch () =
@@ -85,7 +84,6 @@ let run () =
                     printfn "id author Houijasu"
                     printfn "option name Hash type spin default 64 min 1 max 8192"
                     printfn "option name Threads type spin default 1 min 1 max 256"
-                    printfn "option name MACHINE type check default false"
                     printfn "option name EvalFile type string default <embedded>"
                     printfn "uciok"
                 | "isready" -> printfn "readyok"
@@ -104,8 +102,6 @@ let run () =
                         | "threads" ->
                             st.ThreadCount <- max 1 (min 256 (int tokens.[vi + 1]))
                             AlterEgo.Search.ensureHelpers st
-                        | "machine" ->
-                            machineOn <- tokens.[vi + 1].ToLowerInvariant() = "true"
                         | "evalfile" ->
                             let path = String.Join(" ", tokens.[vi + 1 ..])
                             if AlterEgo.Nnue.load path then
@@ -131,10 +127,12 @@ let run () =
                     // "stop" can then never be overwritten by the search thread
                     st.Stop.Value <- false
                     let limits = parseGo pos tokens
-                    // MACHINE mode needs a concrete time budget; fall back to Ego otherwise
+                    // MACHINE is the engine's algorithm (hardwired). It allocates a
+                    // millisecond budget; budgetless modes (depth/nodes/infinite,
+                    // e.g. GUI analysis) run the Ego core directly — MACHINE's
+                    // allocation is meaningless without a clock.
                     let machineBudget =
-                        if not machineOn then 0L
-                        elif limits.MoveTimeMs > 0L then limits.MoveTimeMs
+                        if limits.MoveTimeMs > 0L then limits.MoveTimeMs
                         elif limits.TimeMs > 0L then
                             let mtg = if limits.MovesToGo > 0 then int64 limits.MovesToGo + 1L else 32L
                             limits.TimeMs / mtg + limits.IncMs / 2L

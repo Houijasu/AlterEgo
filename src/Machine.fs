@@ -1,13 +1,15 @@
 module AlterEgo.Machine
 
-// MACHINE rung 2 — the Alter layer over the Ego (see docs/MACHINE.md).
+// MACHINE rung 4 — the Alter layer over the Ego (see docs/MACHINE.md).
 //
-// Hybrid budget: Phase 1 runs one shared iterative-deepening pass (the Ego at
-// full strength — with lazy SMP when Threads > 1). Phase 2 spends the remaining
-// budget information-directed: screen every other root move with one cheap
-// warm-TT probe, then deep-verify the top contenders; switch only on a clear
-// margin at comparable depth. With Threads > 1, screening and verification
-// probes run on parallel lanes (per-lane Position + State, shared TT + stop).
+// Phase 1 (85% of budget): one shared iterative-deepening pass — the Ego at
+// full strength (SMP-aware). Phase 2 (15%): root verification. Screening is
+// FREE: the seed's transposition table already holds values for every root
+// child, so contenders are identified by TT lookup, not fresh searches. Only
+// the top contenders get a deep verification probe, and the seeded leader
+// stands unless a challenger beats it by a clear margin at comparable depth.
+// Hard minimax values throughout — never averaged, never outranked by
+// shallower evidence.
 
 open System.Threading
 open AlterEgo.Types
@@ -17,8 +19,8 @@ open AlterEgo.Search
 
 type Arm =
     { Move: Move
-      mutable Cp: int        // latest probe value, root-stm POV
-      mutable Depth: int }   // deepest completed probe
+      mutable Cp: int        // latest value, root-stm POV
+      mutable Depth: int }   // depth of the evidence behind Cp
 
 let private probeAt (pos: Position) (st: State) (arm: Arm) (d: int) =
     st.ContIdx.[1] <- pos.Mailbox.[moveFrom arm.Move] * 64 + moveTo arm.Move
@@ -28,8 +30,6 @@ let private probeAt (pos: Position) (st: State) (arm: Arm) (d: int) =
     if not st.Stop.Value then
         arm.Cp <- v
         arm.Depth <- d
-        true
-    else false
 
 /// MACHINE move selection under a millisecond budget.
 let think (pos: Position) (st: State) (budgetMs: int64) (verbose: bool) : Move =
@@ -46,18 +46,18 @@ let think (pos: Position) (st: State) (budgetMs: int64) (verbose: bool) : Move =
     if legal.Count = 0 then NoMove
     elif legal.Count = 1 then legal.[0]
     else
-        // ---- Phase 1: shared iterative deepening (the Ego seed, SMP-aware) ----
-        let seedMs = max 1L (budgetMs * 7L / 10L)
-        let idMove = AlterEgo.Search.think pos st { defaultLimits with MoveTimeMs = seedMs } false
+        // ---- Phase 1: the seed gets the FULL budget (identical to raw Ego) ----
+        // The Ego's soft-stop ends early rather than start an unfinishable depth;
+        // Phase 2 runs purely on that leftover time — verification is free.
+        let idMove = AlterEgo.Search.think pos st { defaultLimits with MoveTimeMs = budgetMs } false
         let idScore = st.BestScore
         let idDepth = st.CompletedDepth
         let seedNodes = st.Nodes
 
-        // ---- Phase 2: information-directed verification of contenders ----
         let arms = ResizeArray<Arm>()
         let mutable leader: Arm = Unchecked.defaultof<Arm>
         for m in legal do
-            let arm = { Move = m; Cp = 0; Depth = 0 }
+            let arm = { Move = m; Cp = -Infinity; Depth = 0 }
             if m = idMove then
                 arm.Cp <- idScore
                 arm.Depth <- max 1 idDepth
@@ -65,82 +65,70 @@ let think (pos: Position) (st: State) (budgetMs: int64) (verbose: bool) : Move =
             arms.Add arm
 
         let remaining = budgetMs - swTotal.ElapsedMilliseconds - 20L
-        if remaining < 30L || obj.ReferenceEquals(leader, null) then
+        if remaining < 50L || obj.ReferenceEquals(leader, null) || idDepth < 4 then
             if verbose then
                 printfn "info string machine verdict %s (seed only) depth %d cp %d"
                     (moveToUci idMove) idDepth idScore
             idMove
         else
-            st.Nodes <- seedNodes
             st.Stop.Value <- false
             st.Sw.Restart()
             st.HardMs <- max 1L remaining
             st.NodeLimit <- 0UL
 
-            // lane resources: lane 0 = main st/pos, lanes 1.. = cached helpers
-            ensureHelpers st
-            let lanes = max 1 (min st.ThreadCount (st.HelperStates.Length + 1))
-            let lanePos i = if i = 0 then pos else st.HelperPositions.[i - 1]
-            let laneSt i = if i = 0 then st else st.HelperStates.[i - 1]
-            for i in 1 .. lanes - 1 do
-                let hs = st.HelperStates.[i - 1]
-                hs.Nodes <- 0UL
-                hs.HardMs <- max 1L remaining
-                hs.NodeLimit <- 0UL
-                hs.Sw.Restart()
-                copyInto pos st.HelperPositions.[i - 1]
+            // ---- free screen: the seed's TT already valued every root child ----
+            for a in arms do
+                if not (obj.ReferenceEquals(a, leader)) then
+                    makeMove pos a.Move
+                    let tte = st.Tt.Probe pos.Key
+                    if tte.Hit then
+                        a.Cp <- -(scoreFromTt tte.Score 1)
+                        a.Depth <- tte.Depth
+                    unmakeMove pos a.Move
 
-            /// run f over indices [0..count-1] strided across the lanes
-            let parallelOver (count: int) (f: int -> int -> unit) =
-                if lanes <= 1 || count <= 1 then
-                    for k in 0 .. count - 1 do f 0 k
-                else
-                    let threads =
-                        [| for li in 1 .. lanes - 1 ->
-                             let t = Thread((fun () ->
-                                 try
-                                     let mutable k = li
-                                     while k < count do
-                                         f li k
-                                         k <- k + lanes
-                                 with ex -> logCrash "machine lane" ex), 16 * 1024 * 1024)
-                             t.IsBackground <- true
-                             t.Start()
-                             t |]
-                    let mutable k = 0
-                    while k < count do
-                        f 0 k
-                        k <- k + lanes
-                    for t in threads do t.Join(int remaining + 2000) |> ignore
-
-            // ---- screen: one cheap warm-TT probe per non-leader arm, in parallel ----
-            let screenDepth = max 5 (idDepth - 6)
-            let others = arms |> Seq.filter (fun a -> not (obj.ReferenceEquals(a, leader))) |> Seq.toArray
-            parallelOver others.Length (fun li k ->
-                probeAt (lanePos li) (laneSt li) others.[k] screenDepth |> ignore)
-
-            // ---- verify: deepen the top contenders near the leader, in parallel ----
-            let screenMargin = 60
+            // ---- verify: deep probes for the top TT-screened contenders only ----
+            let screenMargin = 40
             let switchMargin = 20
             let contenders =
-                others
-                |> Array.filter (fun a -> a.Depth > 0 && a.Cp >= leader.Cp - screenMargin)
-                |> Array.sortByDescending (fun a -> a.Cp)
-                |> Array.truncate (max 2 (lanes - 1))
-            parallelOver contenders.Length (fun li k ->
-                let c = contenders.[k]
-                let p = lanePos li
-                let s = laneSt li
-                probeAt p s c (max 1 (idDepth - 2)) |> ignore
-                if not s.Stop.Value && c.Cp > leader.Cp then
-                    probeAt p s c idDepth |> ignore
-                if verbose && not s.Stop.Value then
-                    printfn "info string machine verify %s depth %d cp %d (leader %s cp %d) time %d"
-                        (moveToUci c.Move) c.Depth c.Cp (moveToUci leader.Move) leader.Cp
-                        swTotal.ElapsedMilliseconds)
+                arms
+                |> Seq.filter (fun a ->
+                    not (obj.ReferenceEquals(a, leader))
+                    && a.Depth > 0
+                    && a.Cp >= leader.Cp - screenMargin)
+                |> Seq.sortByDescending (fun a -> a.Cp)
+                |> Seq.truncate 2
+                |> Seq.toArray
+
+            if contenders.Length > 0 then
+                ensureHelpers st
+                let lanes = max 1 (min st.ThreadCount (min contenders.Length (st.HelperStates.Length + 1)))
+                let lanePos i = if i = 0 then pos else st.HelperPositions.[i - 1]
+                let laneSt i = if i = 0 then st else st.HelperStates.[i - 1]
+                for i in 1 .. lanes - 1 do
+                    let hs = st.HelperStates.[i - 1]
+                    hs.Nodes <- 0UL
+                    hs.HardMs <- max 1L remaining
+                    hs.NodeLimit <- 0UL
+                    hs.Sw.Restart()
+                    copyInto pos st.HelperPositions.[i - 1]
+                let verifyDepth = max 1 (idDepth - 1)
+                let threads =
+                    [| for li in 1 .. lanes - 1 ->
+                         let t = Thread((fun () ->
+                             try probeAt (lanePos li) (laneSt li) contenders.[li] verifyDepth
+                             with ex -> logCrash "machine lane" ex), 16 * 1024 * 1024)
+                         t.IsBackground <- true
+                         t.Start()
+                         t |]
+                probeAt (lanePos 0) (laneSt 0) contenders.[0] verifyDepth
+                for t in threads do t.Join(int remaining + 2000) |> ignore
+                if verbose then
+                    for c in contenders do
+                        printfn "info string machine verify %s depth %d cp %d (leader %s cp %d)"
+                            (moveToUci c.Move) c.Depth c.Cp (moveToUci leader.Move) leader.Cp
 
             // Decision: the seeded leader stands unless a challenger beats it by a
-            // clear margin at comparable depth. Shallow noise never outranks depth.
+            // clear margin at comparable depth. Shallow evidence never outranks deep.
             let mutable chosen = leader
             for a in arms do
                 if a.Depth >= idDepth - 1 && a.Cp >= chosen.Cp + switchMargin then chosen <- a
@@ -149,10 +137,10 @@ let think (pos: Position) (st: State) (budgetMs: int64) (verbose: bool) : Move =
                 let ms = max 1L swTotal.ElapsedMilliseconds
                 let mutable nodes = st.Nodes
                 for h in st.HelperStates do nodes <- nodes + h.Nodes
-                let nps = nodes * 1000UL / uint64 ms
                 printfn "info depth %d score cp %d nodes %d nps %d time %d pv %s"
-                    chosen.Depth chosen.Cp nodes nps ms (moveToUci chosen.Move)
-                printfn "info string machine verdict %s depth %d cp %d (seed %s d%d cp %d) lanes %d"
+                    chosen.Depth chosen.Cp nodes (nodes * 1000UL / uint64 ms) ms (moveToUci chosen.Move)
+                printfn "info string machine verdict %s depth %d cp %d (seed %s d%d cp %d) contenders %d"
                     (moveToUci chosen.Move) chosen.Depth chosen.Cp
-                    (moveToUci idMove) idDepth idScore lanes
+                    (moveToUci idMove) idDepth idScore
+                    (arms |> Seq.filter (fun a -> a.Depth > 0 && not (obj.ReferenceEquals(a, leader)) && a.Cp >= leader.Cp - screenMargin) |> Seq.length)
             chosen.Move
