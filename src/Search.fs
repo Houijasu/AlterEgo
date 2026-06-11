@@ -49,6 +49,7 @@ type State =
       CorrHist: int[]        // [stm * 16384 + (pawnKey & 16383)] — eval correction
       ContHist: int[]        // [(prevPiece*64+prevTo) * 768 + piece*64+to] — continuation
       ContIdx: int[]         // per-ply: previous move's piece*64+to, or -1 (null/root)
+      EvalStack: int[]       // per-ply static eval (MinValue = in check / unknown)
       Buffers: Move[][]
       Scores: int[][]
       QuietBuf: Move[][]     // staged-generation / probcut scratch
@@ -73,6 +74,7 @@ let private newState (tt: Table) (stop: StopFlag) =
       CorrHist = Array.zeroCreate (2 * 16384)
       ContHist = Array.zeroCreate (768 * 768)
       ContIdx = Array.create (MaxPly + 2) -1
+      EvalStack = Array.create (MaxPly + 2) System.Int32.MinValue
       Buffers = Array.init MaxPly (fun _ -> Array.zeroCreate<Move> 256)
       Scores = Array.init MaxPly (fun _ -> Array.zeroCreate<int> 256)
       QuietBuf = Array.init MaxPly (fun _ -> Array.zeroCreate<Move> 256)
@@ -96,8 +98,8 @@ let ensureHelpers (st: State) =
         for h in st.HelperStates do h.Tt <- st.Tt
 
 // Search features ship default-on only once individually SPRT-proven.
-// Promoted: singular (+38 @128g, 2026-06-10), lmp (+58 @128g, 2026-06-11).
-// Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist.
+// Promoted: singular (+38 @128g), lmp (+58 @128g, base2 +24), improving (+24 @128g).
+// Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist, seequiet.
 // Promoted features can be switched off via ALTEREGO_DISABLE for A/B runs.
 let private parseSet (envVar: string) =
     match System.Environment.GetEnvironmentVariable envVar with
@@ -113,6 +115,7 @@ let private useCorrHist = enabled.Contains "corrhist"
 let private useContHist = enabled.Contains "conthist"
 let private useLmp = not (disabled.Contains "lmp")
 let private useSeeQuiet = enabled.Contains "seequiet"
+let private useImproving = not (disabled.Contains "improving")
 
 // margin knobs for tuning sweeps: ALTEREGO_TUNE=sbetamult=3,corrdiv=32,pcmargin=200
 let private tune =
@@ -292,10 +295,18 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                 let depth = if inChk then depthIn + 1 else depthIn   // check extension
                 let rawEval = if inChk then -Infinity else evaluate pos
                 let staticEval = if inChk then -Infinity else correctedEval pos st rawEval
-                // reverse futility pruning
+                // improving: static eval trend vs two plies ago (unknown => true)
+                st.EvalStack.[ply] <- if inChk then System.Int32.MinValue else staticEval
+                let improving =
+                    not inChk
+                    && (ply < 2
+                        || st.EvalStack.[ply - 2] = System.Int32.MinValue
+                        || staticEval > st.EvalStack.[ply - 2])
+                // reverse futility pruning (improving: slightly smaller margin)
+                let rfpDepth = if useImproving && improving then max 1 (depth - 1) else depth
                 let mutable earlyCut = System.Int32.MinValue
                 if not inChk && not isRoot && depth <= 8
-                   && not (isMateScore beta) && staticEval - 80 * depth >= beta then
+                   && not (isMateScore beta) && staticEval - 80 * rfpDepth >= beta then
                     earlyCut <- staticEval
                 // null-move pruning
                 if earlyCut = System.Int32.MinValue
@@ -394,11 +405,14 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                 let quiet = not (isCapture pos m) && moveFlag m <> FlagPromo
                                 // late move pruning: enough legal moves searched at
                                 // shallow depth => remaining quiets are skipped
+                                let lmpThreshold =
+                                    let b = lmpBase + depth * depth
+                                    if useImproving && not improving then b / 2 else b
                                 let lmpSkip =
                                     useLmp && quiet && not inChk && not isRoot
                                     && depth <= lmpMaxDepth
                                     && not (isMateScore alpha)
-                                    && legalCount >= lmpBase + depth * depth
+                                    && legalCount >= lmpThreshold
                                 // SEE pruning: skip quiets that lose material on arrival
                                 // (seeGe last — it's the costly test, && short-circuits)
                                 let seeSkip =
