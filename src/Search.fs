@@ -107,11 +107,11 @@ let ensureHelpers (st: State) =
 
 // Search features ship default-on only once individually SPRT-proven.
 // Promoted: singular (+38 @128g), lmp (+58 @128g, base2 +24), improving (+24 @128g),
-//           qstt (+27 @192g), qschecks (+45 @192g), capthist (+36 @192g solo).
+//           qstt (+27 @192g), qschecks (+45 @192g), capthist (+36 @192g solo),
+//           cutlmr (+31 @192g solo; re-proved ON TOP of capthist +47 @192g —
+//           the neutral cutlmr+capthist-vs-none run was sampling noise).
 // Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist, seequiet,
-//           staged (+4 @192g = neutral, parked),
-//           cutlmr (+31 @192g solo BUT cutlmr+capthist combined +2 @192g —
-//           interaction suspected; must re-prove vs the capthist baseline).
+//           staged (+4 @192g = neutral, parked).
 // Promoted features can be switched off via ALTEREGO_DISABLE for A/B runs.
 let private parseSet (envVar: string) =
     match System.Environment.GetEnvironmentVariable envVar with
@@ -130,7 +130,7 @@ let private useSeeQuiet = enabled.Contains "seequiet"
 let private useImproving = not (disabled.Contains "improving")
 let private useQsTT = not (disabled.Contains "qstt")
 let private useQsChecks = not (disabled.Contains "qschecks")
-let private useCutLmr = enabled.Contains "cutlmr"
+let private useCutLmr = not (disabled.Contains "cutlmr")
 let private useCaptHist = not (disabled.Contains "capthist")
 let private useStaged = enabled.Contains "staged"
 
