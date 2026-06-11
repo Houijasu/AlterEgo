@@ -120,7 +120,14 @@ let run () =
                     Array.Clear(st.ContHist, 0, st.ContHist.Length)
                 | "position" ->
                     stopSearch ()
-                    parsePosition pos tokens
+                    try
+                        parsePosition pos tokens
+                    with ex ->
+                        // malformed FEN/moves must not kill the engine or leave
+                        // a half-mutated position behind
+                        logCrash "position parse" ex
+                        setFen pos StartFen
+                        printfn "info string invalid position command — reset to startpos"
                 | "go" ->
                     stopSearch ()
                     // reset on the command thread BEFORE the worker exists: a later

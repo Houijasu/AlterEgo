@@ -18,10 +18,11 @@ let private H = 256      // hidden size (= Nnue.HiddenSize)
 [<Literal>]
 let private SampleBytes = 100
 
-// input size is runtime: 768 * kingBuckets (set once by run)
+// input size is runtime: 768 (flat) / 3072 (own-king) / 6144 (dual-king factorized)
 let mutable private In = 768
 let mutable private buckets = 1
 let mutable private mirror = false
+let mutable private dual = false
 
 type private Net =
     { W1: float32[]      // In*H, feature-major
@@ -81,11 +82,15 @@ let private extractFeatures (data: byte[]) (off: int) (fs: int[]) (fo: int[]) =
             while ok && bb <> 0UL do
                 let sq = System.Numerics.BitOperations.TrailingZeroCount bb
                 bb <- bb &&& (bb - 1UL)
-                if cnt >= 32 then ok <- false
+                if cnt >= 64 then ok <- false
                 else
                     fs.[cnt] <- AlterEgo.Nnue.featureIndexK stm pc sq kStm buckets mirror
                     fo.[cnt] <- AlterEgo.Nnue.featureIndexK opp pc sq kOpp buckets mirror
                     cnt <- cnt + 1
+                    if dual then
+                        fs.[cnt] <- AlterEgo.Nnue.featureIndexE stm pc sq kOpp
+                        fo.[cnt] <- AlterEgo.Nnue.featureIndexE opp pc sq kStm
+                        cnt <- cnt + 1
             pc <- pc + 1
         if ok then cnt else -1
 
@@ -172,16 +177,19 @@ let private export (net: Net) (path: string) =
           W2 = Array.map (fun w -> q w qb) net.W2
           B2 = int (round (float (net.B2 * qa * qb)))
           Buckets = buckets
-          Mirror = mirror }
+          Mirror = mirror
+          Dual = dual }
     AlterEgo.Nnue.save path n
     printfn "exported %s" path
 
 let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
-    buckets <- max 1 (min 4 kingBuckets)
+    // 1 = flat 768; 4 = own-king buckets (3072); 8 = factorized dual-king (6144)
+    dual <- kingBuckets >= 8
+    buckets <- if dual then 4 else max 1 (min 4 kingBuckets)
     mirror <- buckets > 1
-    In <- 768 * buckets
-    printfn "architecture: (%d -> %d)x2 -> 1  (%d king buckets%s)"
-        In H buckets (if mirror then ", mirrored" else "")
+    In <- if dual then 6144 else 768 * buckets
+    printfn "architecture: (%d -> %d)x2 -> 1  (%d king buckets%s%s)"
+        In H buckets (if mirror then ", mirrored" else "") (if dual then ", dual-king factorized" else "")
     let data = File.ReadAllBytes dataPath
     let total = data.Length / SampleBytes
     let valCount = max 1 (total / 100)
@@ -220,8 +228,8 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
                 Array.Clear(g.GB1, 0, g.GB1.Length)
                 Array.Clear(g.GW2, 0, g.GW2.Length)
                 g.GB2 <- 0.0f
-                let fs = Array.zeroCreate 33
-                let fo = Array.zeroCreate 33
+                let fs = Array.zeroCreate 66
+                let fo = Array.zeroCreate 66
                 let accS = Array.zeroCreate<float32> H
                 let accO = Array.zeroCreate<float32> H
                 let lo = b + t * chunk
@@ -251,8 +259,8 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
             batches <- batches + 1
             b <- b + count
         // validation
-        let fs = Array.zeroCreate 33
-        let fo = Array.zeroCreate 33
+        let fs = Array.zeroCreate 66
+        let fo = Array.zeroCreate 66
         let accS = Array.zeroCreate<float32> H
         let accO = Array.zeroCreate<float32> H
         let gDummy = newGrad ()

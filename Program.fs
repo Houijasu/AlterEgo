@@ -57,7 +57,7 @@ let private dispatch argv =
     | [| "perft"; depth |] ->
         AlterEgo.Magics.init ()
         let pos = fromFen StartFen
-        let d = int depth
+        let d = min 64 (int depth)   // per-ply buffers are bounded
         let sw = Stopwatch.StartNew()
         let nodes = perftRoot pos d
         sw.Stop()
@@ -67,13 +67,13 @@ let private dispatch argv =
     | [| "perft"; depth; fen |] ->
         AlterEgo.Magics.init ()
         let pos = fromFen fen
-        let nodes = perftRoot pos (int depth)
+        let nodes = perftRoot pos (min 64 (int depth))
         printfn "perft(%s) = %d" depth nodes
         0
     | [| "divide"; depth; fen |] ->
         AlterEgo.Magics.init ()
         let pos = fromFen fen
-        divide pos (int depth) |> ignore
+        divide pos (min 64 (int depth)) |> ignore
         0
     | [| "suite" |] -> runSuite 5
     | [| "suite"; "deep" |] -> runSuite 6

@@ -40,7 +40,8 @@ type Network =
       W2: int16[]   // [2 * HiddenSize]: side-to-move half, then opponent half
       B2: int32
       Buckets: int  // 1 (legacy 768) or 4 (king-bucketed, with mirroring)
-      Mirror: bool }
+      Mirror: bool
+      Dual: bool }  // factorized dual-king: + enemy-king-bucketed block (input 6144)
 
 let mutable net: Network option = None
 
@@ -49,6 +50,9 @@ let mutable active = false
 
 /// true when king moves require an accumulator rebuild (bucketed nets)
 let mutable kingSensitive = false
+
+/// true when ANY king move rebuilds BOTH perspectives (dual-king nets)
+let mutable dualRebuild = false
 
 // king-zone buckets, indexed by own-perspective king square AFTER mirroring
 // (king always on files a-d here): castled-zone splits on ranks 1-2, then bands
@@ -60,6 +64,17 @@ let private bucketTable =
         elif r <= 3 then 2
         else 3)
 
+// valid input layouts: 768 (flat), 3072 (own-king 4-bucket), 6144 (dual-king factorized)
+let private layoutOk (inp: int) = inp = 768 || inp = 3072 || inp = 6144
+
+let private install (b1: int16[]) (w1: int16[]) (w2: int16[]) (b2: int32) (inp: int) =
+    let dual = inp = 6144
+    let buckets = if dual then 4 else inp / 768
+    net <- Some { W1 = w1; B1 = b1; W2 = w2; B2 = b2; Buckets = buckets; Mirror = inp > 768; Dual = dual }
+    active <- true
+    kingSensitive <- inp > 768
+    dualRebuild <- dual
+
 let load (path: string) : bool =
     try
         use br = new BinaryReader(File.OpenRead path)
@@ -67,23 +82,20 @@ let load (path: string) : bool =
         else
             let inp = br.ReadInt32()
             let hid = br.ReadInt32()
-            if hid <> HiddenSize || inp % 768 <> 0 || inp / 768 < 1 || inp / 768 > MaxBuckets then false
+            if hid <> HiddenSize || not (layoutOk inp) then false
             else
                 let b1 = Array.init HiddenSize (fun _ -> br.ReadInt16())
                 let w1 = Array.init (inp * HiddenSize) (fun _ -> br.ReadInt16())
                 let w2 = Array.init (2 * HiddenSize) (fun _ -> br.ReadInt16())
                 let b2 = br.ReadInt32()
-                let buckets = inp / 768
-                net <- Some { W1 = w1; B1 = b1; W2 = w2; B2 = b2; Buckets = buckets; Mirror = buckets > 1 }
-                active <- true
-                kingSensitive <- buckets > 1
+                install b1 w1 w2 b2 inp
                 true
     with _ -> false
 
 let save (path: string) (n: Network) =
     use bw = new BinaryWriter(File.Create path)
     bw.Write Magic
-    bw.Write (n.Buckets * 768)
+    bw.Write (if n.Dual then 6144 else n.Buckets * 768)
     bw.Write HiddenSize
     for v in n.B1 do bw.Write v
     for v in n.W1 do bw.Write v
@@ -102,16 +114,13 @@ let loadEmbedded () : bool =
             else
                 let inp = br.ReadInt32()
                 let hid = br.ReadInt32()
-                if hid <> HiddenSize || inp % 768 <> 0 || inp / 768 < 1 || inp / 768 > MaxBuckets then false
+                if hid <> HiddenSize || not (layoutOk inp) then false
                 else
                     let b1 = Array.init HiddenSize (fun _ -> br.ReadInt16())
                     let w1 = Array.init (inp * HiddenSize) (fun _ -> br.ReadInt16())
                     let w2 = Array.init (2 * HiddenSize) (fun _ -> br.ReadInt16())
                     let b2 = br.ReadInt32()
-                    let buckets = inp / 768
-                    net <- Some { W1 = w1; B1 = b1; W2 = w2; B2 = b2; Buckets = buckets; Mirror = buckets > 1 }
-                    active <- true
-                    kingSensitive <- buckets > 1
+                    install b1 w1 w2 b2 inp
                     true
     with _ -> false
 
@@ -127,6 +136,17 @@ let featureIndexK (persp: int) (pc: int) (sq: int) (kingSq: int) (buckets: int) 
             oSq <- oSq ^^^ 7
             oK <- oK ^^^ 7
         (bucketTable.[oK] * 12 + oPc) * 64 + oSq
+
+/// Enemy-king-bucketed block (factorized dual-king nets): same scheme, bucketed
+/// and mirrored by the perspective's OPPONENT king, offset past block A (3072).
+let featureIndexE (persp: int) (pc: int) (sq: int) (enemyKingSq: int) =
+    let mutable oSq = if persp = White then sq else sq ^^^ 56
+    let oPc = if persp = White then pc else (if pc < 6 then pc + 6 else pc - 6)
+    let mutable oK = if persp = White then enemyKingSq else enemyKingSq ^^^ 56
+    if (oK &&& 7) >= 4 then
+        oSq <- oSq ^^^ 7
+        oK <- oK ^^^ 7
+    3072 + (bucketTable.[oK] * 12 + oPc) * 64 + oSq
 
 let inline private addColumn (acc: int16[]) (accOff: int) (w: int16[]) (wOff: int) =
     let vc = Vector<int16>.Count
@@ -151,18 +171,22 @@ let inline pushCopy (stack: int16[][]) (ply: int) =
     System.Array.Copy(stack.[ply], stack.[ply + 1], AccSize)
 
 /// apply "piece pc appears on sq" to ONE perspective of acc
-let addFeatureTo (acc: int16[]) (persp: int) (pc: int) (sq: int) (kingSq: int) =
+let addFeatureTo (acc: int16[]) (persp: int) (pc: int) (sq: int) (ownK: int) (enemyK: int) =
     match net with
     | Some n ->
         let off = if persp = White then 0 else HiddenSize
-        addColumn acc off n.W1 (featureIndexK persp pc sq kingSq n.Buckets n.Mirror * HiddenSize)
+        addColumn acc off n.W1 (featureIndexK persp pc sq ownK n.Buckets n.Mirror * HiddenSize)
+        if n.Dual then
+            addColumn acc off n.W1 (featureIndexE persp pc sq enemyK * HiddenSize)
     | None -> ()
 
-let removeFeatureFrom (acc: int16[]) (persp: int) (pc: int) (sq: int) (kingSq: int) =
+let removeFeatureFrom (acc: int16[]) (persp: int) (pc: int) (sq: int) (ownK: int) (enemyK: int) =
     match net with
     | Some n ->
         let off = if persp = White then 0 else HiddenSize
-        subColumn acc off n.W1 (featureIndexK persp pc sq kingSq n.Buckets n.Mirror * HiddenSize)
+        subColumn acc off n.W1 (featureIndexK persp pc sq ownK n.Buckets n.Mirror * HiddenSize)
+        if n.Dual then
+            subColumn acc off n.W1 (featureIndexE persp pc sq enemyK * HiddenSize)
     | None -> ()
 
 /// rebuild ONE perspective of acc from raw piece bitboards
@@ -170,7 +194,8 @@ let rebuildPersp (acc: int16[]) (persp: int) (byPiece: uint64[]) =
     match net with
     | Some n ->
         let off = if persp = White then 0 else HiddenSize
-        let kSq = BitOperations.TrailingZeroCount byPiece.[persp * 6 + King]
+        let kOwn = BitOperations.TrailingZeroCount byPiece.[persp * 6 + King]
+        let kEnemy = BitOperations.TrailingZeroCount byPiece.[(persp ^^^ 1) * 6 + King]
         for j in 0 .. HiddenSize - 1 do
             acc.[off + j] <- n.B1.[j]
         for pc in 0 .. 11 do
@@ -178,7 +203,9 @@ let rebuildPersp (acc: int16[]) (persp: int) (byPiece: uint64[]) =
             while bb <> 0UL do
                 let sq = BitOperations.TrailingZeroCount bb
                 bb <- bb &&& (bb - 1UL)
-                addColumn acc off n.W1 (featureIndexK persp pc sq kSq n.Buckets n.Mirror * HiddenSize)
+                addColumn acc off n.W1 (featureIndexK persp pc sq kOwn n.Buckets n.Mirror * HiddenSize)
+                if n.Dual then
+                    addColumn acc off n.W1 (featureIndexE persp pc sq kEnemy * HiddenSize)
     | None -> ()
 
 /// rebuild both perspectives (setFen / verification)

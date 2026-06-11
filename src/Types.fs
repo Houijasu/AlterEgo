@@ -33,7 +33,10 @@ let squareName (sq: int) =
 
 let parseSquare (s: string) =
     if s.Length < 2 then -1
-    else mkSquare (int s.[0] - int 'a') (int s.[1] - int '1')
+    else
+        let f = int s.[0] - int 'a'
+        let r = int s.[1] - int '1'
+        if f < 0 || f > 7 || r < 0 || r > 7 then -1 else mkSquare f r
 
 // Move encoding (uint16):
 //   bits 0-5   from square

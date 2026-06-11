@@ -101,8 +101,10 @@ let inline addPiece (pos: Position) (pc: int) (sq: int) =
     pos.Phase <- pos.Phase + Psqt.phase.[pc]
     if pos.AccUpdating then
         let acc = pos.AccStack.[pos.Ply]
-        if not pos.AccRebuildW then Nnue.addFeatureTo acc White pc sq (lsb pos.ByPiece.[King])
-        if not pos.AccRebuildB then Nnue.addFeatureTo acc Black pc sq (lsb pos.ByPiece.[6 + King])
+        let wk = lsb pos.ByPiece.[King]
+        let bk = lsb pos.ByPiece.[6 + King]
+        if not pos.AccRebuildW then Nnue.addFeatureTo acc White pc sq wk bk
+        if not pos.AccRebuildB then Nnue.addFeatureTo acc Black pc sq bk wk
 
 let inline removePiece (pos: Position) (pc: int) (sq: int) =
     let bb = bit sq
@@ -116,8 +118,10 @@ let inline removePiece (pos: Position) (pc: int) (sq: int) =
     pos.Phase <- pos.Phase - Psqt.phase.[pc]
     if pos.AccUpdating then
         let acc = pos.AccStack.[pos.Ply]
-        if not pos.AccRebuildW then Nnue.removeFeatureFrom acc White pc sq (lsb pos.ByPiece.[King])
-        if not pos.AccRebuildB then Nnue.removeFeatureFrom acc Black pc sq (lsb pos.ByPiece.[6 + King])
+        let wk = lsb pos.ByPiece.[King]
+        let bk = lsb pos.ByPiece.[6 + King]
+        if not pos.AccRebuildW then Nnue.removeFeatureFrom acc White pc sq wk bk
+        if not pos.AccRebuildB then Nnue.removeFeatureFrom acc Black pc sq bk wk
 
 let inline movePiece (pos: Position) (pc: int) (fromSq: int) (toSq: int) =
     let bb = bit fromSq ||| bit toSq
@@ -132,14 +136,14 @@ let inline movePiece (pos: Position) (pc: int) (fromSq: int) (toSq: int) =
     pos.Eg <- pos.Eg + Psqt.eg.[pc].[toSq] - Psqt.eg.[pc].[fromSq]
     if pos.AccUpdating then
         let acc = pos.AccStack.[pos.Ply]
+        let wk = lsb pos.ByPiece.[King]
+        let bk = lsb pos.ByPiece.[6 + King]
         if not pos.AccRebuildW then
-            let wk = lsb pos.ByPiece.[King]
-            Nnue.removeFeatureFrom acc White pc fromSq wk
-            Nnue.addFeatureTo acc White pc toSq wk
+            Nnue.removeFeatureFrom acc White pc fromSq wk bk
+            Nnue.addFeatureTo acc White pc toSq wk bk
         if not pos.AccRebuildB then
-            let bk = lsb pos.ByPiece.[6 + King]
-            Nnue.removeFeatureFrom acc Black pc fromSq bk
-            Nnue.addFeatureTo acc Black pc toSq bk
+            Nnue.removeFeatureFrom acc Black pc fromSq bk wk
+            Nnue.addFeatureTo acc Black pc toSq bk wk
 
 let inline kingSquare (pos: Position) (color: int) =
     lsb pos.ByPiece.[color * 6 + King]
@@ -177,9 +181,14 @@ let makeMove (pos: Position) (m: Move) =
     if Nnue.active then
         Nnue.pushCopy pos.AccStack pos.Ply
         pos.AccUpdating <- true
-        // a king move can change its perspective's bucket/mirror: rebuild after
+        // a king move can change its perspective's bucket/mirror: rebuild after.
+        // dual-king nets condition BOTH perspectives on both kings => rebuild both.
         if Nnue.kingSensitive && pieceType piece = King then
-            if us = White then pos.AccRebuildW <- true else pos.AccRebuildB <- true
+            if Nnue.dualRebuild then
+                pos.AccRebuildW <- true
+                pos.AccRebuildB <- true
+            elif us = White then pos.AccRebuildW <- true
+            else pos.AccRebuildB <- true
     let captured = if flag = FlagEnPassant then them * 6 + Pawn else pos.Mailbox.[toSq]
 
     pos.Undos.[pos.Ply] <-

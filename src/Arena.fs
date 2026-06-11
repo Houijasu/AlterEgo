@@ -191,6 +191,7 @@ let runGauntlet (extPath: string) (extOptions: (string * string) list)
     let nextGame = [| -1 |]
     let tally = [| 0; 0; 0 |]   // wins, draws, losses
     let earlyStop = [| false |]
+    let laneFailures = [| 0 |]
     let mutable score = 0.0
     printfn "cage: AlterEgo%s vs %s — %d games at %dms/move, %d lanes"
         (if useMachine then "(MACHINE)" else "") extPath games moveMs lanes
@@ -217,7 +218,9 @@ let runGauntlet (extPath: string) (extOptions: (string * string) list)
                     if llr >= SprtUpper || llr <= SprtLower then
                         System.Threading.Volatile.Write(&earlyStop.[0], true))
                 g <- System.Threading.Interlocked.Increment(&nextGame.[0])
-        with ex -> logCrash "gauntlet lane" ex
+        with ex ->
+            System.Threading.Interlocked.Increment(&laneFailures.[0]) |> ignore
+            logCrash "gauntlet lane" ex
     let threads =
         [| for _ in 1 .. lanes - 1 ->
              let t = System.Threading.Thread(worker, 16 * 1024 * 1024)
@@ -238,6 +241,8 @@ let runGauntlet (extPath: string) (extOptions: (string * string) list)
         elif llr <= SprtLower then "H0 accepted (not stronger)"
         else "inconclusive"
     printfn ""
+    if laneFailures.[0] > 0 then
+        printfn "WARNING: %d lane(s) crashed — results incomplete (see alterego-crash.log)" laneFailures.[0]
     printfn "cage result: +%d =%d -%d (%d games)  score %.1f%%  elo %+.0f  LLR %+.2f [%s]"
         tally.[0] tally.[1] tally.[2] played (pct * 100.0) eloDiff llr verdict
 
@@ -248,6 +253,7 @@ let runMatch (kindA: PlayerKind) (kindB: PlayerKind) (games: int) (moveMs: int64
     let sync = obj ()
     let nextGame = [| -1 |]
     let earlyStop = [| false |]
+    let laneFailures = [| 0 |]
     let mutable winsA = 0
     let mutable winsB = 0
     let mutable draws = 0
@@ -278,7 +284,9 @@ let runMatch (kindA: PlayerKind) (kindB: PlayerKind) (games: int) (moveMs: int64
                     if llr >= SprtUpper || llr <= SprtLower then
                         System.Threading.Volatile.Write(&earlyStop.[0], true))
                 g <- System.Threading.Interlocked.Increment(&nextGame.[0])
-        with ex -> logCrash "match lane" ex
+        with ex ->
+            System.Threading.Interlocked.Increment(&laneFailures.[0]) |> ignore
+            logCrash "match lane" ex
     let threads =
         [| for _ in 1 .. lanes - 1 ->
              let t = System.Threading.Thread(worker, 16 * 1024 * 1024)
@@ -306,6 +314,8 @@ let runMatch (kindA: PlayerKind) (kindB: PlayerKind) (games: int) (moveMs: int64
         if var <= 0.0 then 0.5
         else 0.5 * (1.0 + erf (mu / sqrt (2.0 * var)))
     printfn ""
+    if laneFailures.[0] > 0 then
+        printfn "WARNING: %d lane(s) crashed — results incomplete (see alterego-crash.log)" laneFailures.[0]
     let llr = sprtLlr winsA draws winsB 0.0 5.0
     let verdict =
         if llr >= 2.94 then "H1 accepted (stronger)"

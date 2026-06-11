@@ -109,6 +109,7 @@ let run (games: int) (nodesPerMove: uint64) (outPath: string) (lanes: int) =
     let nextGame = [| 0 |]
     let doneGames = [| 0 |]
     let totalSamples = [| 0L |]
+    let laneFailures = [| 0 |]
     let sw = System.Diagnostics.Stopwatch.StartNew()
     let worker (lane: int) =
         try
@@ -132,7 +133,9 @@ let run (games: int) (nodesPerMove: uint64) (outPath: string) (lanes: int) =
                             doneGames.[0] games totalSamples.[0]
                             (float totalSamples.[0] / sw.Elapsed.TotalSeconds))
                 g <- System.Threading.Interlocked.Increment(&nextGame.[0])
-        with ex -> logCrash "datagen lane" ex
+        with ex ->
+            System.Threading.Interlocked.Increment(&laneFailures.[0]) |> ignore
+            logCrash "datagen lane" ex
     let threads =
         [| for lane in 1 .. lanes - 1 ->
              let t = System.Threading.Thread((fun () -> worker lane), 16 * 1024 * 1024)
@@ -141,4 +144,6 @@ let run (games: int) (nodesPerMove: uint64) (outPath: string) (lanes: int) =
              t |]
     worker 0
     for t in threads do t.Join()
+    if laneFailures.[0] > 0 then
+        printfn "WARNING: %d lane(s) crashed — generation incomplete (see alterego-crash.log)" laneFailures.[0]
     printfn "done: %d samples -> %s" totalSamples.[0] outPath

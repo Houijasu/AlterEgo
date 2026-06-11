@@ -20,6 +20,12 @@ type Engine(path: string, options: (string * string) list) =
             psi.EnvironmentVariables.Remove k |> ignore
     let proc = Process.Start psi
 
+    // drain stderr asynchronously: a noisy engine must not fill the pipe and
+    // deadlock our stdout reads (audit finding)
+    do
+        proc.ErrorDataReceived.Add(fun _ -> ())
+        proc.BeginErrorReadLine()
+
     let send (s: string) =
         proc.StandardInput.WriteLine s
         proc.StandardInput.Flush()
