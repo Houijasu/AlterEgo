@@ -24,11 +24,19 @@ let mutable private buckets = 1
 let mutable private mirror = false
 let mutable private dual = false
 
+// WDL auxiliary loss weight. CP loss is sigmoid-space MSE (~0.012 at
+// convergence); WDL cross-entropy is in nats (~0.6-1.0) — ~50x larger raw.
+// 0.01 keeps the trunk CP-dominated while still training the WDL head.
+[<Literal>]
+let private LambdaWdl = 0.01f
+
 type private Net =
     { W1: float32[]      // In*H, feature-major
       B1: float32[]
       W2: float32[]      // 2H
-      mutable B2: float32 }
+      mutable B2: float32
+      Wwdl: float32[]    // 3 * 2H: (win,draw,loss) x (stm half | opp half)
+      Bwdl: float32[] }  // 3
 
 let private newNet (rng: Random) =
     let scale1 = sqrt (2.0 / 32.0) |> float32      // ~32 active features
@@ -36,19 +44,29 @@ let private newNet (rng: Random) =
     { W1 = Array.init (In * H) (fun _ -> (float32 (rng.NextDouble()) - 0.5f) * 2.0f * scale1)
       B1 = Array.zeroCreate H
       W2 = Array.init (2 * H) (fun _ -> (float32 (rng.NextDouble()) - 0.5f) * 2.0f * scale2)
-      B2 = 0.0f }
+      B2 = 0.0f
+      Wwdl = Array.init (3 * 2 * H) (fun _ -> (float32 (rng.NextDouble()) - 0.5f) * 2.0f * scale2)
+      Bwdl = Array.zeroCreate 3 }
 
 type private Grad =
     { GW1: float32[]
       GB1: float32[]
       GW2: float32[]
-      mutable GB2: float32 }
+      mutable GB2: float32
+      GWwdl: float32[]
+      GBwdl: float32[]
+      mutable LossCp: float
+      mutable LossWdl: float }
 
 let private newGrad () =
     { GW1 = Array.zeroCreate (In * H)
       GB1 = Array.zeroCreate H
       GW2 = Array.zeroCreate (2 * H)
-      GB2 = 0.0f }
+      GB2 = 0.0f
+      GWwdl = Array.zeroCreate (3 * 2 * H)
+      GBwdl = Array.zeroCreate 3
+      LossCp = 0.0
+      LossWdl = 0.0 }
 
 let inline private addVec (dst: float32[]) (dstOff: int) (src: float32[]) (srcOff: int) =
     let vc = Vector<float32>.Count
@@ -94,7 +112,8 @@ let private extractFeatures (data: byte[]) (off: int) (fs: int[]) (fo: int[]) =
             pc <- pc + 1
         if ok then cnt else -1
 
-/// One sample's forward + backward, accumulating into g. Returns squared loss.
+/// One sample's forward + backward (CP + WDL heads), accumulating into g.
+/// Also accumulates per-head losses into g. Returns the CP squared loss.
 let private trainSample (net: Net) (g: Grad) (data: byte[]) (off: int)
                         (fs: int[]) (fo: int[]) (accS: float32[]) (accO: float32[]) =
     let cnt = extractFeatures data off fs fo
@@ -107,6 +126,8 @@ let private trainSample (net: Net) (g: Grad) (data: byte[]) (off: int)
     let target =
         0.7f * sigmoidF (float32 scoreStm / 200.0f)
         + 0.3f * (float32 (resStm + 1) * 0.5f)
+    // WDL: pure game result, one-hot from stm POV (win/draw/loss)
+    let wdlTargetIdx = if resStm > 0 then 0 elif resStm = 0 then 1 else 2
 
     // forward
     Array.blit net.B1 0 accS 0 H
@@ -115,37 +136,80 @@ let private trainSample (net: Net) (g: Grad) (data: byte[]) (off: int)
         addVec accS 0 net.W1 (fs.[i] * H)
         addVec accO 0 net.W1 (fo.[i] * H)
     let mutable u = net.B2
+    let mutable l0 = net.Bwdl.[0]
+    let mutable l1 = net.Bwdl.[1]
+    let mutable l2 = net.Bwdl.[2]
     for j in 0 .. H - 1 do
         let a = accS.[j]
         let c = if a < 0.0f then 0.0f elif a > 1.0f then 1.0f else a
         u <- u + c * net.W2.[j]
+        l0 <- l0 + c * net.Wwdl.[j]
+        l1 <- l1 + c * net.Wwdl.[2 * H + j]
+        l2 <- l2 + c * net.Wwdl.[4 * H + j]
     for j in 0 .. H - 1 do
         let a = accO.[j]
         let c = if a < 0.0f then 0.0f elif a > 1.0f then 1.0f else a
         u <- u + c * net.W2.[H + j]
+        l0 <- l0 + c * net.Wwdl.[H + j]
+        l1 <- l1 + c * net.Wwdl.[2 * H + H + j]
+        l2 <- l2 + c * net.Wwdl.[4 * H + H + j]
 
     let p = sigmoidF (2.0f * u)
     let err = p - target
     let dU = 4.0f * err * p * (1.0f - p)
 
+    // WDL softmax + cross-entropy gradient (scaled by LambdaWdl)
+    let m = max l0 (max l1 l2)
+    let e0 = exp (l0 - m)
+    let e1 = exp (l1 - m)
+    let e2 = exp (l2 - m)
+    let z = e0 + e1 + e2
+    let p0 = e0 / z
+    let p1 = e1 / z
+    let p2 = e2 / z
+    let t0 = if wdlTargetIdx = 0 then 1.0f else 0.0f
+    let t1 = if wdlTargetIdx = 1 then 1.0f else 0.0f
+    let t2 = if wdlTargetIdx = 2 then 1.0f else 0.0f
+    let d0 = LambdaWdl * (p0 - t0)
+    let d1 = LambdaWdl * (p1 - t1)
+    let d2 = LambdaWdl * (p2 - t2)
+    let pTrue = if wdlTargetIdx = 0 then p0 elif wdlTargetIdx = 1 then p1 else p2
+    g.LossWdl <- g.LossWdl + float (-(log (max 1e-9f pTrue)))
+
     // backward
     g.GB2 <- g.GB2 + dU
+    g.GBwdl.[0] <- g.GBwdl.[0] + d0
+    g.GBwdl.[1] <- g.GBwdl.[1] + d1
+    g.GBwdl.[2] <- g.GBwdl.[2] + d2
     for j in 0 .. H - 1 do
         let a = accS.[j]
         let c = if a < 0.0f then 0.0f elif a > 1.0f then 1.0f else a
         g.GW2.[j] <- g.GW2.[j] + dU * c
+        g.GWwdl.[j] <- g.GWwdl.[j] + d0 * c
+        g.GWwdl.[2 * H + j] <- g.GWwdl.[2 * H + j] + d1 * c
+        g.GWwdl.[4 * H + j] <- g.GWwdl.[4 * H + j] + d2 * c
         // reuse accS as dAcc for the sparse W1 update below
-        accS.[j] <- if a > 0.0f && a < 1.0f then dU * net.W2.[j] else 0.0f
+        accS.[j] <-
+            if a > 0.0f && a < 1.0f then
+                dU * net.W2.[j] + d0 * net.Wwdl.[j] + d1 * net.Wwdl.[2 * H + j] + d2 * net.Wwdl.[4 * H + j]
+            else 0.0f
     for j in 0 .. H - 1 do
         let a = accO.[j]
         let c = if a < 0.0f then 0.0f elif a > 1.0f then 1.0f else a
         g.GW2.[H + j] <- g.GW2.[H + j] + dU * c
-        accO.[j] <- if a > 0.0f && a < 1.0f then dU * net.W2.[H + j] else 0.0f
+        g.GWwdl.[H + j] <- g.GWwdl.[H + j] + d0 * c
+        g.GWwdl.[2 * H + H + j] <- g.GWwdl.[2 * H + H + j] + d1 * c
+        g.GWwdl.[4 * H + H + j] <- g.GWwdl.[4 * H + H + j] + d2 * c
+        accO.[j] <-
+            if a > 0.0f && a < 1.0f then
+                dU * net.W2.[H + j] + d0 * net.Wwdl.[H + j] + d1 * net.Wwdl.[2 * H + H + j] + d2 * net.Wwdl.[4 * H + H + j]
+            else 0.0f
     addVec g.GB1 0 accS 0
     addVec g.GB1 0 accO 0
     for i in 0 .. cnt - 1 do
         addVec g.GW1 (fs.[i] * H) accS 0
         addVec g.GW1 (fo.[i] * H) accO 0
+    g.LossCp <- g.LossCp + float (err * err)
     err * err
 
 // Adam optimizer state
@@ -178,9 +242,66 @@ let private export (net: Net) (path: string) =
           B2 = int (round (float (net.B2 * qa * qb)))
           Buckets = buckets
           Mirror = mirror
-          Dual = dual }
+          Dual = dual
+          Wdl = Array.copy net.Wwdl     // float32 head: no quantization needed
+          WdlBias = Array.copy net.Bwdl }
     AlterEgo.Nnue.save path n
     printfn "exported %s" path
+
+/// Forward-only WDL reliability report over the holdout range: 10 bins of
+/// predicted expected score (Pw + Pd/2) vs actual outcome.
+let private calibrationReport (net: Net) (data: byte[]) (fromIdx: int) (toIdx: int) =
+    let fs = Array.zeroCreate 66
+    let fo = Array.zeroCreate 66
+    let accS = Array.zeroCreate<float32> H
+    let accO = Array.zeroCreate<float32> H
+    let binPred = Array.zeroCreate<float> 10
+    let binActual = Array.zeroCreate<float> 10
+    let binCount = Array.zeroCreate<int> 10
+    for k in fromIdx .. toIdx - 1 do
+        let off = k * SampleBytes
+        let cnt = extractFeatures data off fs fo
+        if cnt >= 0 then
+            let stm = int data.[off + 96]
+            let resultWhite = int (sbyte data.[off + 99])
+            let resStm = if stm = 0 then resultWhite else -resultWhite
+            Array.blit net.B1 0 accS 0 H
+            Array.blit net.B1 0 accO 0 H
+            for i in 0 .. cnt - 1 do
+                addVec accS 0 net.W1 (fs.[i] * H)
+                addVec accO 0 net.W1 (fo.[i] * H)
+            let mutable l0 = net.Bwdl.[0]
+            let mutable l1 = net.Bwdl.[1]
+            let mutable l2 = net.Bwdl.[2]
+            for j in 0 .. H - 1 do
+                let cS = (let a = accS.[j] in if a < 0.0f then 0.0f elif a > 1.0f then 1.0f else a)
+                let cO = (let a = accO.[j] in if a < 0.0f then 0.0f elif a > 1.0f then 1.0f else a)
+                l0 <- l0 + cS * net.Wwdl.[j] + cO * net.Wwdl.[H + j]
+                l1 <- l1 + cS * net.Wwdl.[2 * H + j] + cO * net.Wwdl.[2 * H + H + j]
+                l2 <- l2 + cS * net.Wwdl.[4 * H + j] + cO * net.Wwdl.[4 * H + H + j]
+            let m = max l0 (max l1 l2)
+            let e0 = exp (l0 - m)
+            let e1 = exp (l1 - m)
+            let e2 = exp (l2 - m)
+            let z = e0 + e1 + e2
+            let predScore = float ((e0 + 0.5f * e1) / z)
+            let actual = float (resStm + 1) * 0.5
+            let bin = min 9 (int (predScore * 10.0))
+            binPred.[bin] <- binPred.[bin] + predScore
+            binActual.[bin] <- binActual.[bin] + actual
+            binCount.[bin] <- binCount.[bin] + 1
+    printfn "WDL calibration (holdout): bin  predicted  actual  n"
+    let mutable ece = 0.0
+    let mutable total = 0
+    for b in 0 .. 9 do
+        if binCount.[b] > 0 then
+            let p = binPred.[b] / float binCount.[b]
+            let a = binActual.[b] / float binCount.[b]
+            ece <- ece + abs (p - a) * float binCount.[b]
+            total <- total + binCount.[b]
+            printfn "  %d0%%  %.3f  %.3f  %d" b p a binCount.[b]
+    if total > 0 then
+        printfn "  expected calibration error: %.4f" (ece / float total)
 
 let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
     // 1 = flat 768; 4 = own-king buckets (3072); 8 = factorized dual-king (6144)
@@ -202,6 +323,8 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
     let adamB1 = { M = Array.zeroCreate H; V = Array.zeroCreate H }
     let adamW2 = { M = Array.zeroCreate (2 * H); V = Array.zeroCreate (2 * H) }
     let adamB2 = { M = Array.zeroCreate 1; V = Array.zeroCreate 1 }
+    let adamWwdl = { M = Array.zeroCreate (3 * 2 * H); V = Array.zeroCreate (3 * 2 * H) }
+    let adamBwdl = { M = Array.zeroCreate 3; V = Array.zeroCreate 3 }
 
     let threads = max 1 (Environment.ProcessorCount - 1)
     let grads = Array.init threads (fun _ -> newGrad ())
@@ -216,6 +339,7 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
             let j = rng.Next(i + 1)
             let t = perm.[i] in perm.[i] <- perm.[j]; perm.[j] <- t
         let mutable epochLoss = 0.0
+        let mutable epochWdl = 0.0
         let mutable batches = 0
         let mutable b = 0
         while b < trainCount do
@@ -227,7 +351,11 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
                 Array.Clear(g.GW1, 0, g.GW1.Length)
                 Array.Clear(g.GB1, 0, g.GB1.Length)
                 Array.Clear(g.GW2, 0, g.GW2.Length)
+                Array.Clear(g.GWwdl, 0, g.GWwdl.Length)
+                Array.Clear(g.GBwdl, 0, g.GBwdl.Length)
                 g.GB2 <- 0.0f
+                g.LossCp <- 0.0
+                g.LossWdl <- 0.0
                 let fs = Array.zeroCreate 66
                 let fo = Array.zeroCreate 66
                 let accS = Array.zeroCreate<float32> H
@@ -245,17 +373,23 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
                 for i in 0 .. g0.GW1.Length - 1 do g0.GW1.[i] <- g0.GW1.[i] + gt.GW1.[i]
                 for i in 0 .. g0.GB1.Length - 1 do g0.GB1.[i] <- g0.GB1.[i] + gt.GB1.[i]
                 for i in 0 .. g0.GW2.Length - 1 do g0.GW2.[i] <- g0.GW2.[i] + gt.GW2.[i]
+                for i in 0 .. g0.GWwdl.Length - 1 do g0.GWwdl.[i] <- g0.GWwdl.[i] + gt.GWwdl.[i]
+                for i in 0 .. 2 do g0.GBwdl.[i] <- g0.GBwdl.[i] + gt.GBwdl.[i]
                 g0.GB2 <- g0.GB2 + gt.GB2
+                g0.LossWdl <- g0.LossWdl + gt.LossWdl
             let scale = 1.0f / float32 count
             adamStep net.W1 adamW1 g0.GW1 lr 1.98f scale
             adamStep net.B1 adamB1 g0.GB1 lr 1.98f scale
             adamStep net.W2 adamW2 g0.GW2 lr 1.98f scale
+            adamStep net.Wwdl adamWwdl g0.GWwdl lr 10.0f scale   // float head: wide clip
+            adamStep net.Bwdl adamBwdl g0.GBwdl lr 10.0f scale
             // B2 scalar via tiny arrays
             let gb2 = [| g0.GB2 |]
             let wb2 = [| net.B2 |]
             adamStep wb2 adamB2 gb2 lr 1000.0f scale
             net.B2 <- wb2.[0]
             epochLoss <- epochLoss + Array.sum losses
+            epochWdl <- epochWdl + g0.LossWdl
             batches <- batches + 1
             b <- b + count
         // validation
@@ -267,8 +401,11 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
         let mutable valLoss = 0.0
         for k in trainCount .. total - 1 do
             valLoss <- valLoss + float (trainSample net gDummy data (k * SampleBytes) fs fo accS accO)
-        printfn "epoch %2d  train %.6f  val %.6f  lr %.5f  (%.0fs)"
-            epoch (epochLoss / float trainCount) (valLoss / float valCount) lr sw.Elapsed.TotalSeconds
+        printfn "epoch %2d  cp %.6f/%.6f  wdl %.4f/%.4f  lr %.5f  (%.0fs)"
+            epoch (epochLoss / float trainCount) (valLoss / float valCount)
+            (epochWdl / float trainCount) (gDummy.LossWdl / float valCount)
+            lr sw.Elapsed.TotalSeconds
         if epoch % 6 = 0 then lr <- lr * 0.5f
         export net outPath
+    calibrationReport net data trainCount total
     printfn "done in %.0fs" sw.Elapsed.TotalSeconds

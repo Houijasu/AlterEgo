@@ -41,7 +41,11 @@ type Network =
       B2: int32
       Buckets: int  // 1 (legacy 768) or 4 (king-bucketed, with mirroring)
       Mirror: bool
-      Dual: bool }  // factorized dual-king: + enemy-king-bucketed block (input 6144)
+      Dual: bool    // factorized dual-king: + enemy-king-bucketed block (input 6144)
+      // WDL head (v2 nets; empty for v1): float32, consumed at probe-root
+      // frequency only — never in the search hot path
+      Wdl: float32[]      // [3 * AccSize]: (win,draw,loss) x (stm 256 | opp 256)
+      WdlBias: float32[] } // [3]
 
 let mutable net: Network option = None
 
@@ -67,40 +71,57 @@ let private bucketTable =
 // valid input layouts: 768 (flat), 3072 (own-king 4-bucket), 6144 (dual-king factorized)
 let private layoutOk (inp: int) = inp = 768 || inp = 3072 || inp = 6144
 
-let private install (b1: int16[]) (w1: int16[]) (w2: int16[]) (b2: int32) (inp: int) =
+let private install (b1: int16[]) (w1: int16[]) (w2: int16[]) (b2: int32) (inp: int) (wdl: float32[]) (wdlB: float32[]) =
     let dual = inp = 6144
     let buckets = if dual then 4 else inp / 768
-    net <- Some { W1 = w1; B1 = b1; W2 = w2; B2 = b2; Buckets = buckets; Mirror = inp > 768; Dual = dual }
+    net <- Some { W1 = w1; B1 = b1; W2 = w2; B2 = b2; Buckets = buckets; Mirror = inp > 768
+                  Dual = dual; Wdl = wdl; WdlBias = wdlB }
     active <- true
     kingSensitive <- inp > 768
     dualRebuild <- dual
 
+/// Read a net from an open reader. Format v1: magic, inputSize, ... .
+/// Format v2: magic, -2, inputSize, ... + float32 WDL head appended.
+let private readNet (br: BinaryReader) : bool =
+    if br.ReadInt32() <> Magic then false
+    else
+        let second = br.ReadInt32()
+        let version = if second = -2 then 2 else 1
+        let inp = if version = 2 then br.ReadInt32() else second
+        let hid = br.ReadInt32()
+        if hid <> HiddenSize || not (layoutOk inp) then false
+        else
+            let b1 = Array.init HiddenSize (fun _ -> br.ReadInt16())
+            let w1 = Array.init (inp * HiddenSize) (fun _ -> br.ReadInt16())
+            let w2 = Array.init (2 * HiddenSize) (fun _ -> br.ReadInt16())
+            let b2 = br.ReadInt32()
+            let wdl, wdlB =
+                if version = 2 then
+                    Array.init (3 * AccSize) (fun _ -> br.ReadSingle()),
+                    Array.init 3 (fun _ -> br.ReadSingle())
+                else [||], [||]
+            install b1 w1 w2 b2 inp wdl wdlB
+            true
+
 let load (path: string) : bool =
     try
         use br = new BinaryReader(File.OpenRead path)
-        if br.ReadInt32() <> Magic then false
-        else
-            let inp = br.ReadInt32()
-            let hid = br.ReadInt32()
-            if hid <> HiddenSize || not (layoutOk inp) then false
-            else
-                let b1 = Array.init HiddenSize (fun _ -> br.ReadInt16())
-                let w1 = Array.init (inp * HiddenSize) (fun _ -> br.ReadInt16())
-                let w2 = Array.init (2 * HiddenSize) (fun _ -> br.ReadInt16())
-                let b2 = br.ReadInt32()
-                install b1 w1 w2 b2 inp
-                true
+        readNet br
     with _ -> false
 
 let save (path: string) (n: Network) =
     use bw = new BinaryWriter(File.Create path)
     bw.Write Magic
+    if n.Wdl.Length > 0 then bw.Write -2   // v2 marker
     bw.Write (if n.Dual then 6144 else n.Buckets * 768)
     bw.Write HiddenSize
     for v in n.B1 do bw.Write v
     for v in n.W1 do bw.Write v
     for v in n.W2 do bw.Write v
     bw.Write n.B2
+    if n.Wdl.Length > 0 then
+        for v in n.Wdl do bw.Write v
+        for v in n.WdlBias do bw.Write v
 
 /// Load the network embedded in the executable (the zero-configuration default)
 let loadEmbedded () : bool =
@@ -110,18 +131,7 @@ let loadEmbedded () : bool =
         if isNull s then false
         else
             use br = new BinaryReader(s)
-            if br.ReadInt32() <> Magic then false
-            else
-                let inp = br.ReadInt32()
-                let hid = br.ReadInt32()
-                if hid <> HiddenSize || not (layoutOk inp) then false
-                else
-                    let b1 = Array.init HiddenSize (fun _ -> br.ReadInt16())
-                    let w1 = Array.init (inp * HiddenSize) (fun _ -> br.ReadInt16())
-                    let w2 = Array.init (2 * HiddenSize) (fun _ -> br.ReadInt16())
-                    let b2 = br.ReadInt32()
-                    install b1 w1 w2 b2 inp
-                    true
+            readNet br
     with _ -> false
 
 /// Feature index of piece pc (0..11) on sq, from `persp`'s point of view,
@@ -243,3 +253,32 @@ let evaluateAcc (acc: int16[]) (stm: int) : int =
         let oppOff = HiddenSize - stmOff
         let sum = dotHalf acc stmOff n.W2 0 + dotHalf acc oppOff n.W2 HiddenSize
         (sum + n.B2) * Scale / (QA * QB)
+
+/// WDL probabilities from `stm`'s point of view, or ValueNone for v1 nets.
+/// Float math + softmax: probe-root frequency ONLY, never the search hot path.
+let evaluateWdl (acc: int16[]) (stm: int) : struct (float32 * float32 * float32) voption =
+    match net with
+    | Some n when n.Wdl.Length > 0 ->
+        let stmOff = if stm = White then 0 else HiddenSize
+        let oppOff = HiddenSize - stmOff
+        let inv = 1.0f / float32 QA
+        let logits = Array.zeroCreate<float32> 3
+        for k in 0 .. 2 do
+            let b = k * AccSize
+            let mutable s = n.WdlBias.[k]
+            for j in 0 .. HiddenSize - 1 do
+                let a = int acc.[stmOff + j]
+                let c = if a < 0 then 0 elif a > QA then QA else a
+                s <- s + float32 c * inv * n.Wdl.[b + j]
+            for j in 0 .. HiddenSize - 1 do
+                let a = int acc.[oppOff + j]
+                let c = if a < 0 then 0 elif a > QA then QA else a
+                s <- s + float32 c * inv * n.Wdl.[b + HiddenSize + j]
+            logits.[k] <- s
+        let m = max logits.[0] (max logits.[1] logits.[2])
+        let e0 = exp (logits.[0] - m)
+        let e1 = exp (logits.[1] - m)
+        let e2 = exp (logits.[2] - m)
+        let z = e0 + e1 + e2
+        ValueSome (struct (e0 / z, e1 / z, e2 / z))
+    | _ -> ValueNone
