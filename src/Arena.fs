@@ -13,7 +13,6 @@ open AlterEgo.Search
 type PlayerKind =
     | Ego
     | Machine
-    | PstEgo   // Ego with NNUE suppressed (A/B baseline)
 
 type GameResult =
     | WhiteWins
@@ -137,11 +136,10 @@ let playGame (white: PlayerKind) (black: PlayerKind) (opening: string) (moveMs: 
         else
             let kind = if pos.Stm = White then white else black
             let st = if pos.Stm = White then stWhite else stBlack
-            pos.ForcePst <- (kind = PstEgo)
             st.Stop.Value <- false
             let mv =
                 match kind with
-                | Ego | PstEgo -> think pos st { defaultLimits with MoveTimeMs = moveMs } false
+                | Ego -> think pos st { defaultLimits with MoveTimeMs = moveMs } false
                 | Machine -> AlterEgo.Machine.think pos st moveMs false
             let mv = if mv = NoMove || not (legal.Contains mv) then legal.[0] else mv
             makeMove pos mv
@@ -276,7 +274,7 @@ let runMatch (kindA: PlayerKind) (kindB: PlayerKind) (games: int) (moveMs: int64
     let mutable winsA = 0
     let mutable winsB = 0
     let mutable draws = 0
-    let nameOf k = match k with Ego -> "Ego" | Machine -> "MACHINE" | PstEgo -> "Ego(PST)"
+    let nameOf k = match k with Ego -> "Ego" | Machine -> "MACHINE"
     printfn "match: %s vs %s — %d games at %dms/move, %d lanes" (nameOf kindA) (nameOf kindB) games moveMs lanes
     let worker () =
         try

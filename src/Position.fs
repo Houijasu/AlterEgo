@@ -26,10 +26,6 @@ type Position =
       mutable Full: int
       mutable Key: uint64
       mutable PawnKey: uint64   // Zobrist over pawns only (correction history)
-      // incremental tapered-eval accumulators (White-POV)
-      mutable Mg: int
-      mutable Eg: int
-      mutable Phase: int
       Undos: Undo[]
       mutable Ply: int
       // NNUE accumulator stack, indexed by Ply (per-Position => thread-safe)
@@ -37,9 +33,7 @@ type Position =
       mutable AccUpdating: bool
       // set during makeMove when a king move forces a perspective rebuild
       mutable AccRebuildW: bool
-      mutable AccRebuildB: bool
-      // per-game eval override for A/B testing (thread-safe, unlike a global)
-      mutable ForcePst: bool }
+      mutable AccRebuildB: bool }
 
 let create () =
     { ByPiece = Array.zeroCreate 12
@@ -52,16 +46,12 @@ let create () =
       Full = 1
       Key = 0UL
       PawnKey = 0UL
-      Mg = 0
-      Eg = 0
-      Phase = 0
       Undos = Array.zeroCreate 1024
       Ply = 0
       AccStack = Array.init 1024 (fun _ -> Array.zeroCreate<int16> Nnue.AccSize)
       AccUpdating = false
       AccRebuildW = false
-      AccRebuildB = false
-      ForcePst = false }
+      AccRebuildB = false }
 
 /// Copy src's full game state into dst (helper threads reuse allocated Positions)
 let copyInto (src: Position) (dst: Position) =
@@ -75,14 +65,10 @@ let copyInto (src: Position) (dst: Position) =
     dst.Full <- src.Full
     dst.Key <- src.Key
     dst.PawnKey <- src.PawnKey
-    dst.Mg <- src.Mg
-    dst.Eg <- src.Eg
-    dst.Phase <- src.Phase
     dst.Ply <- src.Ply
     dst.AccUpdating <- false
     dst.AccRebuildW <- false
     dst.AccRebuildB <- false
-    dst.ForcePst <- src.ForcePst
     Array.blit src.Undos 0 dst.Undos 0 src.Ply
     if Nnue.active then
         Array.blit src.AccStack.[src.Ply] 0 dst.AccStack.[dst.Ply] 0 Nnue.AccSize
@@ -96,9 +82,6 @@ let inline addPiece (pos: Position) (pc: int) (sq: int) =
     pos.Mailbox.[sq] <- pc
     pos.Key <- pos.Key ^^^ Zobrist.psq.[pc * 64 + sq]
     if pc % 6 = Pawn then pos.PawnKey <- pos.PawnKey ^^^ Zobrist.psq.[pc * 64 + sq]
-    pos.Mg <- pos.Mg + Psqt.mg.[pc].[sq]
-    pos.Eg <- pos.Eg + Psqt.eg.[pc].[sq]
-    pos.Phase <- pos.Phase + Psqt.phase.[pc]
     if pos.AccUpdating then
         let acc = pos.AccStack.[pos.Ply]
         let wk = lsb pos.ByPiece.[King]
@@ -113,9 +96,6 @@ let inline removePiece (pos: Position) (pc: int) (sq: int) =
     pos.Mailbox.[sq] <- -1
     pos.Key <- pos.Key ^^^ Zobrist.psq.[pc * 64 + sq]
     if pc % 6 = Pawn then pos.PawnKey <- pos.PawnKey ^^^ Zobrist.psq.[pc * 64 + sq]
-    pos.Mg <- pos.Mg - Psqt.mg.[pc].[sq]
-    pos.Eg <- pos.Eg - Psqt.eg.[pc].[sq]
-    pos.Phase <- pos.Phase - Psqt.phase.[pc]
     if pos.AccUpdating then
         let acc = pos.AccStack.[pos.Ply]
         let wk = lsb pos.ByPiece.[King]
@@ -132,8 +112,6 @@ let inline movePiece (pos: Position) (pc: int) (fromSq: int) (toSq: int) =
     pos.Key <- pos.Key ^^^ Zobrist.psq.[pc * 64 + fromSq] ^^^ Zobrist.psq.[pc * 64 + toSq]
     if pc % 6 = Pawn then
         pos.PawnKey <- pos.PawnKey ^^^ Zobrist.psq.[pc * 64 + fromSq] ^^^ Zobrist.psq.[pc * 64 + toSq]
-    pos.Mg <- pos.Mg + Psqt.mg.[pc].[toSq] - Psqt.mg.[pc].[fromSq]
-    pos.Eg <- pos.Eg + Psqt.eg.[pc].[toSq] - Psqt.eg.[pc].[fromSq]
     if pos.AccUpdating then
         let acc = pos.AccStack.[pos.Ply]
         let wk = lsb pos.ByPiece.[King]
@@ -333,9 +311,6 @@ let setFen (pos: Position) (fen: string) =
     Array.fill pos.Mailbox 0 64 -1
     pos.Key <- 0UL
     pos.PawnKey <- 0UL
-    pos.Mg <- 0
-    pos.Eg <- 0
-    pos.Phase <- 0
     pos.Ply <- 0
     let parts = fen.Split(' ') |> Array.filter (fun s -> s <> "")
     // board

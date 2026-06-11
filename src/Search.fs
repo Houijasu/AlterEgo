@@ -343,7 +343,7 @@ let rec qsearch (pos: Position) (st: State) (alphaIn: int) (beta: int) (ply: int
                     && ((let victim =
                             if moveFlag m = FlagEnPassant then Pawn
                             else pieceType pos.Mailbox.[moveTo m]
-                         standPat + pieceValue.[victim] + 200 <= alpha)
+                         standPat + seeValue.[victim] + 200 <= alpha)
                         || not (seeGe pos m 0))
                 if not skip then
                     makeMove pos m

@@ -54,12 +54,11 @@ let private parseGo (pos: Position) (tokens: string[]) =
 
 let run () =
     AlterEgo.Magics.init ()
-    // zero-configuration NNUE: the embedded default net loads unless one is already active
-    if not AlterEgo.Nnue.active then
-        if AlterEgo.Nnue.loadEmbedded () then
-            printfn "info string NNUE: embedded default network loaded"
-        else
-            printfn "info string NNUE: no embedded network — PST evaluation"
+    // zero-configuration NNUE: the embedded default net loads unless one is already
+    // active. The engine is NNUE-only — without a network it refuses to run.
+    let netOk = AlterEgo.Nnue.active || AlterEgo.Nnue.loadEmbedded ()
+    if netOk then printfn "info string NNUE: network loaded"
+    else printfn "info string FATAL: no NNUE network — engine cannot evaluate, exiting"
     let pos = fromFen StartFen
     let mutable st = createState 64
     let mutable worker: Thread = null
@@ -69,7 +68,7 @@ let run () =
         st.Stop.Value <- true
         if worker <> null && worker.IsAlive then worker.Join()
 
-    let mutable running = true
+    let mutable running = netOk
     while running do
         let line = Console.ReadLine()
         if line = null then
@@ -163,14 +162,7 @@ let run () =
                 | "stop" -> stopSearch ()
                 | "d" ->
                     print pos
-                    let nn =
-                        if AlterEgo.Nnue.active
-                        then sprintf "%+d" (AlterEgo.Nnue.evaluateAcc pos.AccStack.[pos.Ply] pos.Stm)
-                        else "off"
-                    pos.ForcePst <- true
-                    let pst = AlterEgo.Eval.evaluate pos
-                    pos.ForcePst <- false
-                    printfn "eval nnue %s  pst %+d (stm POV)" nn pst
+                    printfn "eval nnue %+d (stm POV)" (AlterEgo.Eval.evaluate pos)
                 | "quit" ->
                     stopSearch ()
                     running <- false

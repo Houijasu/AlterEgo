@@ -20,7 +20,6 @@
     <Compile Include="src\Bitboards.fs" />
     <Compile Include="src\Magics.fs" />
     <Compile Include="src\Zobrist.fs" />
-    <Compile Include="src\Psqt.fs" />
     <Compile Include="src\Nnue.fs" />
     <Compile Include="src\Position.fs" />
     <Compile Include="src\MoveGen.fs" />

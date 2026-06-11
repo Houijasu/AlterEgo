@@ -106,7 +106,6 @@ let ``make-unmake restores key and accumulators`` () =
     let pos = fromFen StartFen
     let key = pos.Key
     let pawnKey = pos.PawnKey
-    let mg = pos.Mg
     let m = mkMove 12 28   // e2e4
     makeMove pos m
     Assert.Equal(20, pos.Ep)    // e3
@@ -114,7 +113,6 @@ let ``make-unmake restores key and accumulators`` () =
     unmakeMove pos m
     Assert.Equal(key, pos.Key)
     Assert.Equal(pawnKey, pos.PawnKey)
-    Assert.Equal(mg, pos.Mg)
     Assert.Equal(0, pos.Ply)
 
 [<Fact>]

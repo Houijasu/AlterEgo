@@ -38,13 +38,12 @@ let runSuite (maxDepth: int) =
                 else
                     failures <- failures + 1
                     printfn "FAIL  %-9s d%d  got %d, expected %d" name depth got expected
-        // incremental accumulators must survive the whole make/unmake walk bit-exactly
+        // incremental keys must survive the whole make/unmake walk bit-exactly
         let fresh = fromFen fen
-        if pos.Mg <> fresh.Mg || pos.Eg <> fresh.Eg || pos.Phase <> fresh.Phase
-           || pos.Key <> fresh.Key || pos.PawnKey <> fresh.PawnKey then
+        if pos.Key <> fresh.Key || pos.PawnKey <> fresh.PawnKey then
             failures <- failures + 1
-            printfn "FAIL  %-9s accumulator drift (mg %d/%d eg %d/%d phase %d/%d pawnkey %016X/%016X)"
-                name pos.Mg fresh.Mg pos.Eg fresh.Eg pos.Phase fresh.Phase pos.PawnKey fresh.PawnKey
+            printfn "FAIL  %-9s key drift (key %016X/%016X pawnkey %016X/%016X)"
+                name pos.Key fresh.Key pos.PawnKey fresh.PawnKey
     sw.Stop()
     let nps = float totalNodes / sw.Elapsed.TotalSeconds / 1_000_000.0
     printfn ""
@@ -80,6 +79,10 @@ let private dispatch argv =
     | [| "suite"; "deep" |] -> runSuite 6
     | [| "bench" |] | [| "bench"; _ |] ->
         AlterEgo.Magics.init ()
+        // NNUE-only engine: bench searches with the embedded network
+        if not (AlterEgo.Nnue.active || AlterEgo.Nnue.loadEmbedded ()) then
+            printfn "FATAL: no embedded NNUE network"
+            exit 1
         let depth = if argv.Length > 1 then int argv.[1] else 9
         let st = AlterEgo.Search.createState 64
         let sw = Stopwatch.StartNew()
@@ -97,6 +100,9 @@ let private dispatch argv =
         0
     | [| "machine"; ms |] | [| "machine"; ms; _ |] ->
         AlterEgo.Magics.init ()
+        if not (AlterEgo.Nnue.active || AlterEgo.Nnue.loadEmbedded ()) then
+            printfn "FATAL: no embedded NNUE network"
+            exit 1
         let fen = if argv.Length > 2 then argv.[2] else StartFen
         let pos = fromFen fen
         let st = AlterEgo.Search.createState 64
@@ -105,6 +111,9 @@ let private dispatch argv =
         0
     | [| "match"; games; ms |] | [| "match"; games; ms; _ |] ->
         AlterEgo.Magics.init ()
+        if not (AlterEgo.Nnue.active || AlterEgo.Nnue.loadEmbedded ()) then
+            printfn "FATAL: no embedded NNUE network"
+            exit 1
         let lanes = if argv.Length > 3 then int argv.[3] else max 1 (System.Environment.ProcessorCount / 2 - 1)
         AlterEgo.Arena.runMatch AlterEgo.Arena.PlayerKind.Machine AlterEgo.Arena.PlayerKind.Ego
             (int games) (int64 ms) 32 lanes
@@ -128,7 +137,11 @@ let private dispatch argv =
             printfn "failed to load %s" nf
             1
         | _ ->
-            netFile |> Option.iter (printfn "datagen with NNUE %s")
+            // NNUE-only: no explicit net means datagen runs on the embedded one
+            if netFile.IsNone && not (AlterEgo.Nnue.active || AlterEgo.Nnue.loadEmbedded ()) then
+                printfn "FATAL: no embedded NNUE network"
+                exit 1
+            printfn "datagen with NNUE %s" (defaultArg netFile "<embedded>")
             AlterEgo.Datagen.run (int games) (uint64 nodes) out lanes
             0
     | [| "train"; dataFile; epochs; out |] ->
@@ -194,10 +207,7 @@ let private dispatch argv =
             for (label, fen) in positions do
                 let pos = fromFen fen
                 let nn = AlterEgo.Nnue.evaluateAcc pos.AccStack.[pos.Ply] pos.Stm
-                pos.ForcePst <- true
-                let pst = AlterEgo.Eval.evaluate pos
-                pos.ForcePst <- false
-                printfn "%-36s nnue %+5d  pst %+5d" label nn pst
+                printfn "%-36s nnue %+5d" label nn
             0
     | [| "nnuetest"; netFile |] ->
         // verify incremental accumulators == full rebuild over a deep make/unmake walk
@@ -247,16 +257,6 @@ let private dispatch argv =
                    | Some e -> [ "UCI_LimitStrength", "true"; "UCI_Elo", string e ]
                    | None -> [])
             AlterEgo.Arena.runGauntlet sfPath opts (int games) (int64 ms) 64 false lanes
-            0
-    | [| "matchnnue"; games; ms; netFile |] | [| "matchnnue"; games; ms; netFile; _ |] ->
-        AlterEgo.Magics.init ()
-        if not (AlterEgo.Nnue.load netFile) then
-            printfn "failed to load net %s" netFile
-            1
-        else
-            let lanes = if argv.Length > 4 then int argv.[4] else max 1 (System.Environment.ProcessorCount / 2 - 1)
-            AlterEgo.Arena.runMatch AlterEgo.Arena.PlayerKind.Ego AlterEgo.Arena.PlayerKind.PstEgo
-                (int games) (int64 ms) 32 lanes
             0
     | [||] | [| "uci" |] -> AlterEgo.Uci.run (); 0
     | _ ->

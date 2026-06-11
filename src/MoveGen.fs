@@ -363,7 +363,8 @@ let generateCaptures (pos: Position) (moves: Move[]) : int =
 
     n
 
-let private seeValue = [| 100; 320; 330; 500; 900; 20000 |]
+// the engine's only material table: SEE swaps and qsearch delta pruning
+let seeValue = [| 100; 320; 330; 500; 900; 20000 |]
 
 /// All pieces of both colors attacking sq given occupancy
 let attackersTo (pos: Position) (sq: int) (occ: uint64) =
