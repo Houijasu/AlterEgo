@@ -3,6 +3,8 @@ module AlterEgo.Search
 open System.Diagnostics
 open System.Threading
 open AlterEgo.Types
+open AlterEgo.Bitboards
+open AlterEgo.Magics
 open AlterEgo.Position
 open AlterEgo.MoveGen
 open AlterEgo.Eval
@@ -98,8 +100,9 @@ let ensureHelpers (st: State) =
         for h in st.HelperStates do h.Tt <- st.Tt
 
 // Search features ship default-on only once individually SPRT-proven.
-// Promoted: singular (+38 @128g), lmp (+58 @128g, base2 +24), improving (+24 @128g).
-// Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist, seequiet.
+// Promoted: singular (+38 @128g), lmp (+58 @128g, base2 +24), improving (+24 @128g),
+//           qstt (+27 @192g).
+// Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist, seequiet, qschecks.
 // Promoted features can be switched off via ALTEREGO_DISABLE for A/B runs.
 let private parseSet (envVar: string) =
     match System.Environment.GetEnvironmentVariable envVar with
@@ -116,6 +119,8 @@ let private useContHist = enabled.Contains "conthist"
 let private useLmp = not (disabled.Contains "lmp")
 let private useSeeQuiet = enabled.Contains "seequiet"
 let private useImproving = not (disabled.Contains "improving")
+let private useQsTT = not (disabled.Contains "qstt")
+let private useQsChecks = enabled.Contains "qschecks"
 
 // margin knobs for tuning sweeps: ALTEREGO_TUNE=sbetamult=3,corrdiv=32,pcmargin=200
 let private tune =
@@ -206,12 +211,28 @@ let inline private pickNext (moves: Move[]) (scores: int[]) (i: int) (n: int) =
         let tm = moves.[i] in moves.[i] <- moves.[bi]; moves.[bi] <- tm
         let ts = scores.[i] in scores.[i] <- scores.[bi]; scores.[bi] <- ts
 
-let rec qsearch (pos: Position) (st: State) (alphaIn: int) (beta: int) (ply: int) : int =
+let rec qsearch (pos: Position) (st: State) (alphaIn: int) (beta: int) (ply: int) (checksLeft: int) : int =
     st.Nodes <- st.Nodes + 1UL
     checkUp st
     if st.Stop.Value then 0
     elif ply >= MaxPly - 1 then evaluate pos
     else
+        // TT probe (qstt): cutoffs and move ordering inside quiescence
+        let key = pos.Key
+        let mutable ttCut = System.Int32.MinValue
+        let mutable ttMove = NoMove
+        let mutable ttSeenDepth = -1
+        if useQsTT then
+            let tte = st.Tt.Probe key
+            if tte.Hit then
+                ttSeenDepth <- tte.Depth
+                ttMove <- tte.Move
+                let s = scoreFromTt tte.Score ply
+                if tte.Bound = BoundExact then ttCut <- s
+                elif tte.Bound = BoundLower && s >= beta then ttCut <- s
+                elif tte.Bound = BoundUpper && s <= alphaIn then ttCut <- s
+        if ttCut <> System.Int32.MinValue then ttCut
+        else
         let inChk = inCheck pos
         let mutable alpha = alphaIn
         let standPat = if inChk then -Infinity else correctedEval pos st (evaluate pos)
@@ -220,20 +241,50 @@ let rec qsearch (pos: Position) (st: State) (alphaIn: int) (beta: int) (ply: int
             if standPat > alpha then alpha <- standPat
             let moves = st.Buffers.[ply]
             let scores = st.Scores.[ply]
-            let n =
+            let n0 =
                 if inChk then generate pos moves           // all evasions
                 else generateCaptures pos moves            // tactical moves only
+            // qschecks: at the first quiescence ply, also try quiet checking moves
+            let n =
+                if not inChk && checksLeft > 0 then
+                    let full = st.QuietBuf.[ply]
+                    let nf = generate pos full
+                    let them = pos.Stm ^^^ 1
+                    let kSq = kingSquare pos them
+                    let occ = occupancy pos
+                    let bChk = bishopAttacks kSq occ
+                    let rChk = rookAttacks kSq occ
+                    let mutable k = n0
+                    for fi in 0 .. nf - 1 do
+                        let q = full.[fi]
+                        if not (isCapture pos q) && moveFlag q = FlagNormal && k < 250 then
+                            let checkMask =
+                                match pieceType pos.Mailbox.[moveFrom q] with
+                                | 1 -> knightAttacks.[kSq]                  // Knight
+                                | 2 -> bChk                                 // Bishop
+                                | 3 -> rChk                                 // Rook
+                                | 4 -> bChk ||| rChk                        // Queen
+                                | 0 -> pawnAttacks.[them].[kSq]             // Pawn
+                                | _ -> 0UL
+                            if bit (moveTo q) &&& checkMask <> 0UL && seeGe pos q 0 then
+                                moves.[k] <- q
+                                k <- k + 1
+                    k
+                else n0
             for i in 0 .. n - 1 do
                 let m = moves.[i]
                 scores.[i] <-
-                    if isCapture pos m then
+                    if useQsTT && m = ttMove then 200_000
+                    elif isCapture pos m then
                         let victim =
                             if moveFlag m = FlagEnPassant then Pawn
                             else pieceType pos.Mailbox.[moveTo m]
                         100_000 + victim * 8 - pieceType pos.Mailbox.[moveFrom m]
                     elif moveFlag m = FlagPromo then 90_000 + movePromo m
+                    elif i >= n0 then 60_000                // quiet checks
                     else 0
             let mutable best = standPat
+            let mutable bestMove = NoMove
             let mutable legalCount = 0
             let mutable i = 0
             let mutable stop = false
@@ -254,21 +305,31 @@ let rec qsearch (pos: Position) (st: State) (alphaIn: int) (beta: int) (ply: int
                     if not (wasLegal pos) then unmakeMove pos m
                     else
                         legalCount <- legalCount + 1
-                        let v = -qsearch pos st (-beta) (-alpha) (ply + 1)
+                        let v = -qsearch pos st (-beta) (-alpha) (ply + 1) (max 0 (checksLeft - 1))
                         unmakeMove pos m
                         if st.Stop.Value then stop <- true
                         else
-                            if v > best then best <- v
+                            if v > best then
+                                best <- v
+                                bestMove <- m
                             if v > alpha then alpha <- v
                             if alpha >= beta then stop <- true
                 i <- i + 1
             if st.Stop.Value then 0
             elif inChk && legalCount = 0 then -(MateValue - ply)
-            else best
+            else
+                // qstt store: never clobber real-depth entries with depth-0 facts
+                if useQsTT && ttSeenDepth <= 0 then
+                    let bound =
+                        if best >= beta then BoundLower
+                        elif best > alphaIn then BoundExact
+                        else BoundUpper
+                    st.Tt.Store(key, bestMove, scoreToTt best ply, 0, bound)
+                best
 
 /// Full search with an optional excluded move (singular verification).
 let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn: int) (betaIn: int) (nullOk: bool) (excluded: Move) : int =
-    if depthIn <= 0 then qsearch pos st alphaIn betaIn ply
+    if depthIn <= 0 then qsearch pos st alphaIn betaIn ply (if useQsChecks then 1 else 0)
     else
         st.Nodes <- st.Nodes + 1UL
         checkUp st
@@ -336,7 +397,7 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                             makeMove pos m
                             if not (wasLegal pos) then unmakeMove pos m
                             else
-                                let mutable v = -qsearch pos st (-probCutBeta) (-probCutBeta + 1) (ply + 1)
+                                let mutable v = -qsearch pos st (-probCutBeta) (-probCutBeta + 1) (ply + 1) 0
                                 if v >= probCutBeta && depth >= 6 then
                                     v <- -searchEx pos st (depth - 4) (ply + 1) (-probCutBeta) (-probCutBeta + 1) true NoMove
                                 unmakeMove pos m
