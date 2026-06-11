@@ -118,6 +118,7 @@ let run () =
                     Array.Clear(st.History, 0, st.History.Length)
                     Array.Clear(st.CorrHist, 0, st.CorrHist.Length)
                     Array.Clear(st.ContHist, 0, st.ContHist.Length)
+                    Array.Clear(st.CaptHist, 0, st.CaptHist.Length)
                 | "position" ->
                     stopSearch ()
                     try

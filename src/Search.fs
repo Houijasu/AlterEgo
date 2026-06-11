@@ -50,12 +50,14 @@ type State =
       History: int[]         // [stm * 4096 + from*64+to]
       CorrHist: int[]        // [stm * 16384 + (pawnKey & 16383)] — eval correction
       ContHist: int[]        // [(prevPiece*64+prevTo) * 768 + piece*64+to] — continuation
+      CaptHist: int[]        // [(piece*64+to) * 6 + victimType] — capture ordering
       ContIdx: int[]         // per-ply: previous move's piece*64+to, or -1 (null/root)
       EvalStack: int[]       // per-ply static eval (MinValue = in check / unknown)
       Buffers: Move[][]
       Scores: int[][]
       QuietBuf: Move[][]     // staged-generation / probcut scratch
       TriedQuiets: Move[][]  // quiets searched per ply, for history maluses
+      TriedCapts: Move[][]   // captures searched per ply, for capture-history maluses
       mutable BestMove: Move
       mutable BestScore: int
       mutable CompletedDepth: int
@@ -75,12 +77,14 @@ let private newState (tt: Table) (stop: StopFlag) =
       History = Array.zeroCreate (2 * 4096)
       CorrHist = Array.zeroCreate (2 * 16384)
       ContHist = Array.zeroCreate (768 * 768)
+      CaptHist = Array.zeroCreate (768 * 6)
       ContIdx = Array.create (MaxPly + 2) -1
       EvalStack = Array.create (MaxPly + 2) System.Int32.MinValue
       Buffers = Array.init MaxPly (fun _ -> Array.zeroCreate<Move> 256)
       Scores = Array.init MaxPly (fun _ -> Array.zeroCreate<int> 256)
       QuietBuf = Array.init MaxPly (fun _ -> Array.zeroCreate<Move> 256)
       TriedQuiets = Array.init MaxPly (fun _ -> Array.zeroCreate<Move> 128)
+      TriedCapts = Array.init MaxPly (fun _ -> Array.zeroCreate<Move> 64)
       BestMove = NoMove
       BestScore = 0
       CompletedDepth = 0
@@ -101,8 +105,11 @@ let ensureHelpers (st: State) =
 
 // Search features ship default-on only once individually SPRT-proven.
 // Promoted: singular (+38 @128g), lmp (+58 @128g, base2 +24), improving (+24 @128g),
-//           qstt (+27 @192g), qschecks (+45 @192g).
-// Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist, seequiet.
+//           qstt (+27 @192g), qschecks (+45 @192g), capthist (+36 @192g solo).
+// Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist, seequiet,
+//           staged (+4 @192g = neutral, parked),
+//           cutlmr (+31 @192g solo BUT cutlmr+capthist combined +2 @192g —
+//           interaction suspected; must re-prove vs the capthist baseline).
 // Promoted features can be switched off via ALTEREGO_DISABLE for A/B runs.
 let private parseSet (envVar: string) =
     match System.Environment.GetEnvironmentVariable envVar with
@@ -121,6 +128,9 @@ let private useSeeQuiet = enabled.Contains "seequiet"
 let private useImproving = not (disabled.Contains "improving")
 let private useQsTT = not (disabled.Contains "qstt")
 let private useQsChecks = not (disabled.Contains "qschecks")
+let private useCutLmr = enabled.Contains "cutlmr"
+let private useCaptHist = not (disabled.Contains "capthist")
+let private useStaged = enabled.Contains "staged"
 
 // margin knobs for tuning sweeps: ALTEREGO_TUNE=sbetamult=3,corrdiv=32,pcmargin=200
 let private tune =
@@ -149,6 +159,7 @@ let private lmpBase = tuned "lmpbase" 2         // LMP threshold: base + depth^2
 let private lmpMaxDepth = tuned "lmpdepth" 8    // LMP maximum depth
 let private seeQMargin = tuned "seeqmargin" 60  // SEE quiet pruning: cp lost per depth
 let private seeQDepth = tuned "seeqdepth" 8     // SEE quiet pruning maximum depth
+let private cutR = tuned "cutr" 2               // extra LMR reduction at expected cut nodes
 
 // log-based late-move-reduction table
 let private lmrTable =
@@ -192,6 +203,16 @@ let inline private quietScore (pos: Position) (st: State) (m: Move) (ply: int) =
         let c = if prev >= 0 then st.ContHist.[prev * 768 + moveContIdx pos m] else 0
         min 79_000 (h + c)
 
+// ---- capture history: ordering signal per (piece, to, victim) ----
+let inline private captIdx (pos: Position) (m: Move) =
+    let victim =
+        if moveFlag m = FlagEnPassant then Pawn
+        else pieceType pos.Mailbox.[moveTo m]
+    (pos.Mailbox.[moveFrom m] * 64 + moveTo m) * 6 + victim
+
+let inline private bumpCapt (st: State) (idx: int) (delta: int) =
+    st.CaptHist.[idx] <- max -8192 (min 8192 (st.CaptHist.[idx] + delta))
+
 // ---- correction history: static eval bias per (stm, pawn structure) ----
 let inline private corrIndex (pos: Position) =
     pos.Stm * 16384 + int (pos.PawnKey &&& 16383UL)
@@ -202,6 +223,27 @@ let inline private correctedEval (pos: Position) (st: State) (raw: int) =
         let bound = MateValue - 2 * MaxPly
         let c = raw + st.CorrHist.[corrIndex pos] / corrDiv
         if c > bound then bound elif c < -bound then -bound else c
+
+/// Ordering score for one move (shared by eager and staged generation paths)
+let inline private moveScore (pos: Position) (st: State) (ttMove: Move) (k0: Move) (k1: Move) (ply: int) (m: Move) =
+    if m = ttMove then 1_000_000
+    elif isCapture pos m then
+        let victim =
+            if moveFlag m = FlagEnPassant then Pawn
+            else pieceType pos.Mailbox.[moveTo m]
+        let attacker = pieceType pos.Mailbox.[moveFrom m]
+        // capthist: keep strict MVV order (128 per victim class),
+        // let learned history override LVA within a class
+        let mvvLva =
+            if useCaptHist then
+                victim * 128 - attacker * 8 + st.CaptHist.[captIdx pos m] / 128
+            else victim * 8 - attacker
+        if seeGe pos m 0 then 100_000 + mvvLva + (if moveFlag m = FlagPromo then 50_000 else 0)
+        else 70_000 + mvvLva
+    elif moveFlag m = FlagPromo then 90_000 + movePromo m
+    elif m = k0 then 80_000
+    elif m = k1 then 79_999
+    else quietScore pos st m ply
 
 let inline private pickNext (moves: Move[]) (scores: int[]) (i: int) (n: int) =
     let mutable bi = i
@@ -328,7 +370,9 @@ let rec qsearch (pos: Position) (st: State) (alphaIn: int) (beta: int) (ply: int
                 best
 
 /// Full search with an optional excluded move (singular verification).
-let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn: int) (betaIn: int) (nullOk: bool) (excluded: Move) : int =
+/// cutNode: this node is expected to fail high (null-window scout children);
+/// used only to deepen LMR when the cutlmr feature is enabled.
+let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn: int) (betaIn: int) (nullOk: bool) (cutNode: bool) (excluded: Move) : int =
     if depthIn <= 0 then qsearch pos st alphaIn betaIn ply (if useQsChecks then 1 else 0)
     else
         st.Nodes <- st.Nodes + 1UL
@@ -342,7 +386,10 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
             let beta = betaIn
             let key = pos.Key
             let tte = st.Tt.Probe key
-            let ttMove = if tte.Hit then tte.Move else NoMove
+            // never trust a TT move the generator wouldn't emit here (collision/torn entry)
+            let ttMove =
+                if tte.Hit && tte.Move <> NoMove && isPseudoLegal pos tte.Move then tte.Move
+                else NoMove
             // TT cutoff (never inside an exclusion search)
             let mutable ttCut = System.Int32.MinValue
             if not isRoot && excluded = NoMove && tte.Hit && tte.Depth >= depthIn then
@@ -377,7 +424,7 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                     let r = 2 + depth / 6
                     st.ContIdx.[ply + 1] <- -1
                     makeNull pos
-                    let v = -searchEx pos st (depth - 1 - r) (ply + 1) (-beta) (-beta + 1) false NoMove
+                    let v = -searchEx pos st (depth - 1 - r) (ply + 1) (-beta) (-beta + 1) false (not cutNode) NoMove
                     unmakeNull pos
                     if not st.Stop.Value && v >= beta then
                         earlyCut <- if isMateScore v then beta else v
@@ -399,7 +446,7 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                             else
                                 let mutable v = -qsearch pos st (-probCutBeta) (-probCutBeta + 1) (ply + 1) 0
                                 if v >= probCutBeta && depth >= 6 then
-                                    v <- -searchEx pos st (depth - 4) (ply + 1) (-probCutBeta) (-probCutBeta + 1) true NoMove
+                                    v <- -searchEx pos st (depth - 4) (ply + 1) (-probCutBeta) (-probCutBeta + 1) true (not cutNode) NoMove
                                 unmakeMove pos m
                                 if not st.Stop.Value && v >= probCutBeta then
                                     st.Tt.Store(key, m, scoreToTt v ply, depth - 3, BoundLower)
@@ -415,7 +462,7 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                        && ttMove <> NoMove && tte.Hit && tte.Depth >= depth - 3
                        && tte.Bound <> BoundUpper && not (isMateScore tte.Score) then
                         let sBeta = scoreFromTt tte.Score ply - sBetaMult * depth
-                        let v = searchEx pos st ((depth - 1) / 2) ply (sBeta - 1) sBeta false ttMove
+                        let v = searchEx pos st ((depth - 1) / 2) ply (sBeta - 1) sBeta false cutNode ttMove
                         if not st.Stop.Value then
                             if v < sBeta then singularExt <- 1          // TT move is singular: extend
                             elif sBeta >= beta then mcCut <- sBeta      // multicut: several moves beat beta
@@ -428,25 +475,26 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                         let moves = st.Buffers.[ply]
                         let scores = st.Scores.[ply]
                         let tried = st.TriedQuiets.[ply]
-                        let n = generate pos moves
+                        let triedC = st.TriedCapts.[ply]
                         let k0 = st.Killers.[ply * 2]
                         let k1 = st.Killers.[ply * 2 + 1]
-                        for idx in 0 .. n - 1 do
-                            let m = moves.[idx]
-                            scores.[idx] <-
-                                if m = ttMove then 1_000_000
-                                elif isCapture pos m then
-                                    let victim =
-                                        if moveFlag m = FlagEnPassant then Pawn
-                                        else pieceType pos.Mailbox.[moveTo m]
-                                    let attacker = pieceType pos.Mailbox.[moveFrom m]
-                                    let mvvLva = victim * 8 - attacker
-                                    if seeGe pos m 0 then 100_000 + mvvLva + (if moveFlag m = FlagPromo then 50_000 else 0)
-                                    else 70_000 + mvvLva
-                                elif moveFlag m = FlagPromo then 90_000 + movePromo m
-                                elif m = k0 then 80_000
-                                elif m = k1 then 79_999
-                                else quietScore pos st m ply
+                        // staged: search the validated TT move BEFORE generating anything;
+                        // a stage-0 cutoff skips movegen+scoring+sorting entirely. The TT
+                        // move is pseudo-legal-checked, so playing it ungated is safe, and
+                        // it is dropped from the generated list later (never emitted late —
+                        // the bug that cost -100 Elo in the first staged attempt).
+                        let stage0 = useStaged && ttMove <> NoMove && ttMove <> excluded
+                        let mutable generated = not stage0
+                        let mutable n =
+                            if stage0 then
+                                moves.[0] <- ttMove
+                                scores.[0] <- 1_000_000
+                                1
+                            else
+                                let cnt = generate pos moves
+                                for idx in 0 .. cnt - 1 do
+                                    scores.[idx] <- moveScore pos st ttMove k0 k1 ply moves.[idx]
+                                cnt
                         let futilityOk =
                             not inChk && not isRoot && depth <= 6
                             && not (isMateScore alpha)
@@ -456,14 +504,31 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                         let mutable bound = BoundUpper
                         let mutable legalCount = 0
                         let mutable triedQuiets = 0
+                        let mutable triedCapts = 0
                         let mutable i = 0
                         let mutable cut = false
-                        while not cut && i < n do
-                            if true then
+                        while not cut && (i < n || not generated) do
+                            if i >= n then
+                                // stage 1: the TT move didn't cut — generate the rest
+                                let scratch = st.QuietBuf.[ply]
+                                let total = generate pos scratch
+                                let mutable k = n
+                                for j in 0 .. total - 1 do
+                                    let mv = scratch.[j]
+                                    if mv <> ttMove then
+                                        moves.[k] <- mv
+                                        scores.[k] <- moveScore pos st ttMove k0 k1 ply mv
+                                        k <- k + 1
+                                n <- k
+                                generated <- true
+                            if i < n then
                                 pickNext moves scores i n
                                 let m = moves.[i]
                                 let mScore = scores.[i]
-                                let quiet = not (isCapture pos m) && moveFlag m <> FlagPromo
+                                let isCap = isCapture pos m
+                                let quiet = not isCap && moveFlag m <> FlagPromo
+                                // capture-history index reads the mailbox: take it pre-make
+                                let mCaptIdx = if useCaptHist && isCap then captIdx pos m else -1
                                 // late move pruning: enough legal moves searched at
                                 // shallow depth => remaining quiets are skipped
                                 let lmpThreshold =
@@ -496,22 +561,27 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                         if quiet && triedQuiets < 128 then
                                             tried.[triedQuiets] <- m
                                             triedQuiets <- triedQuiets + 1
+                                        elif useCaptHist && isCap && triedCapts < 64 then
+                                            triedC.[triedCapts] <- m
+                                            triedCapts <- triedCapts + 1
                                         let newDepth = depth - 1 + (if m = ttMove then singularExt else 0)
+                                        let isPv = betaIn - alphaIn > 1
                                         let v =
                                             if legalCount = 1 then
-                                                -searchEx pos st newDepth (ply + 1) (-beta) (-alpha) true NoMove
+                                                -searchEx pos st newDepth (ply + 1) (-beta) (-alpha) true (if isPv then false else not cutNode) NoMove
                                             else
                                                 let mutable r = 0
                                                 if quiet && depth >= 3 && legalCount > 3 && not inChk then
                                                     r <- lmrTable.[min depth 63, min legalCount 63]
                                                     if mScore >= 79_999 then r <- r - 1   // killers
+                                                    if useCutLmr && cutNode then r <- r + cutR
                                                     if r > newDepth - 1 then r <- newDepth - 1
                                                     if r < 0 then r <- 0
-                                                let mutable v' = -searchEx pos st (newDepth - r) (ply + 1) (-alpha - 1) (-alpha) true NoMove
+                                                let mutable v' = -searchEx pos st (newDepth - r) (ply + 1) (-alpha - 1) (-alpha) true true NoMove
                                                 if v' > alpha && r > 0 then
-                                                    v' <- -searchEx pos st newDepth (ply + 1) (-alpha - 1) (-alpha) true NoMove
+                                                    v' <- -searchEx pos st newDepth (ply + 1) (-alpha - 1) (-alpha) true (not cutNode) NoMove
                                                 if v' > alpha && v' < beta then
-                                                    v' <- -searchEx pos st newDepth (ply + 1) (-beta) (-alpha) true NoMove
+                                                    v' <- -searchEx pos st newDepth (ply + 1) (-beta) (-alpha) true false NoMove
                                                 v'
                                         unmakeMove pos m
                                         if st.Stop.Value then cut <- true
@@ -525,6 +595,15 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                                 if isRoot then st.BestMove <- m
                                             if alpha >= beta then
                                                 bound <- BoundLower
+                                                // capture history: reward the cutting capture,
+                                                // demote captures that were tried and failed
+                                                // (position is restored here — captIdx is valid)
+                                                if useCaptHist then
+                                                    let cBonus = depth * depth
+                                                    if mCaptIdx >= 0 then bumpCapt st mCaptIdx cBonus
+                                                    for c in 0 .. triedCapts - 1 do
+                                                        if triedC.[c] <> m then
+                                                            bumpCapt st (captIdx pos triedC.[c]) (-cBonus)
                                                 if quiet then
                                                     let k0 = st.Killers.[ply * 2]
                                                     if m <> k0 then
@@ -567,9 +646,9 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                     st.CorrHist.[ci] <- max -4096 (min 4096 nv)
                             best
 
-/// Standard entry point (no excluded move)
+/// Standard entry point (no excluded move, not an expected cut node)
 let search (pos: Position) (st: State) (depth: int) (ply: int) (alpha: int) (beta: int) (nullOk: bool) : int =
-    searchEx pos st depth ply alpha beta nullOk NoMove
+    searchEx pos st depth ply alpha beta nullOk false NoMove
 
 /// Walk the TT to build a PV string (best-effort)
 let getPvString (pos: Position) (st: State) (maxLen: int) =
@@ -620,6 +699,7 @@ let private helperLoop (pos: Position) (st: State) (maxDepth: int) (offset: int)
 /// CONTRACT: the caller resets st.Stop on the command thread BEFORE calling —
 /// think never un-sets a stop request (doing so races a concurrent "stop").
 let think (pos: Position) (st: State) (limits: Limits) (verbose: bool) : Move =
+    st.Tt.NewSearch()   // age the shared TT before helpers launch
     st.Nodes <- 0UL
     st.BestMove <- NoMove
     st.BestScore <- 0
@@ -628,6 +708,9 @@ let think (pos: Position) (st: State) (limits: Limits) (verbose: bool) : Move =
     System.Array.Clear(st.Killers, 0, st.Killers.Length)
     for i in 0 .. st.History.Length - 1 do
         st.History.[i] <- st.History.[i] / 8
+    if useCaptHist then
+        for i in 0 .. st.CaptHist.Length - 1 do
+            st.CaptHist.[i] <- st.CaptHist.[i] / 8
     st.Sw.Restart()
 
     let softMs, hardMs =

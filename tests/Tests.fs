@@ -122,6 +122,44 @@ let ``setFen rejects nothing silently: castling and ep parsed`` () =
     Assert.Equal(parseSquare "e3", pos.Ep)
     Assert.Equal(Black, pos.Stm)
 
+// ---- isPseudoLegal: exact agreement with the generator ----
+
+[<Fact>]
+let ``isPseudoLegal equals generator membership over all encodings`` () =
+    // every position class: start, tactical (kiwipete), endgame, promotion storm,
+    // pinned/checky (pos5), quiet middlegame, plus live ep + castling rights
+    let fens =
+        [ StartFen
+          "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+          "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"
+          "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1"
+          "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8"
+          "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10"
+          "r3k2r/8/8/8/3pP3/8/8/R3K2R b KQkq e3 0 1" ]
+    let buf = Array.zeroCreate<Move> 256
+    for fen in fens do
+        let pos = fromFen fen
+        let n = generate pos buf
+        let generated = System.Collections.Generic.HashSet<Move>()
+        for i in 0 .. n - 1 do generated.Add buf.[i] |> ignore
+        for code in 0 .. 65535 do
+            let m : Move = uint16 code
+            let v = isPseudoLegal pos m
+            if v <> generated.Contains m then
+                Assert.Fail(sprintf "isPseudoLegal=%b generator=%b for %s (raw %04x) in %s"
+                                v (generated.Contains m) (moveToUci m) code fen)
+
+[<Fact>]
+let ``isPseudoLegal rejects stale moves after the position changes`` () =
+    // a TT collision scenario: moves valid at startpos, probed after e2e4
+    let pos = fromFen StartFen
+    let e2e4 = mkMove 12 28
+    Assert.True(isPseudoLegal pos e2e4)
+    makeMove pos e2e4
+    Assert.False(isPseudoLegal pos e2e4)          // square now empty
+    Assert.False(isPseudoLegal pos (mkMove 1 18)) // white knight, black to move
+    Assert.True(isPseudoLegal pos (mkMove 52 36)) // e7e5 is black's move
+
 [<Fact>]
 let ``illegal moves are filtered by wasLegal`` () =
     // white king on e1 pinned-rook scenario: moving the pinned piece is illegal

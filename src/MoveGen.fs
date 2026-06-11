@@ -168,6 +168,93 @@ let inline wasLegal (pos: Position) =
     let mover = pos.Stm ^^^ 1
     not (isAttacked pos (kingSquare pos mover) pos.Stm)
 
+/// Would `generate` emit this move in this position? Guards the search against
+/// trusting a TT move that no longer fits the position (hash collision, torn
+/// entry) — required before a TT move may be played without being generated.
+let isPseudoLegal (pos: Position) (m: Move) : bool =
+    if m = NoMove then false
+    else
+        let fromSq = moveFrom m
+        let toSq = moveTo m
+        let flag = moveFlag m
+        let us = pos.Stm
+        let pc = pos.Mailbox.[fromSq]
+        if pc < 0 || pc / 6 <> us then false
+        elif fromSq = toSq then false
+        elif flag <> FlagPromo && (int m >>> 12) &&& 3 <> 0 then false   // junk promo bits
+        else
+            let pt = pieceType pc
+            let dst = pos.Mailbox.[toSq]
+            let dstOwn = dst >= 0 && dst / 6 = us
+            let dstEnemy = dst >= 0 && dst / 6 <> us
+            let occ = occupancy pos
+            match flag with
+            | FlagCastle ->
+                // replicate the generator: rights + empty path + unattacked transit
+                if pt <> King then false
+                elif us = White && fromSq = 4 && toSq = 6 then
+                    pos.Castling &&& 1 <> 0
+                    && occ &&& 0x60UL = 0UL
+                    && not (isAttacked pos 4 Black)
+                    && not (isAttacked pos 5 Black)
+                    && not (isAttacked pos 6 Black)
+                elif us = White && fromSq = 4 && toSq = 2 then
+                    pos.Castling &&& 2 <> 0
+                    && occ &&& 0xEUL = 0UL
+                    && not (isAttacked pos 4 Black)
+                    && not (isAttacked pos 3 Black)
+                    && not (isAttacked pos 2 Black)
+                elif us = Black && fromSq = 60 && toSq = 62 then
+                    pos.Castling &&& 4 <> 0
+                    && occ &&& 0x6000000000000000UL = 0UL
+                    && not (isAttacked pos 60 White)
+                    && not (isAttacked pos 61 White)
+                    && not (isAttacked pos 62 White)
+                elif us = Black && fromSq = 60 && toSq = 58 then
+                    pos.Castling &&& 8 <> 0
+                    && occ &&& 0x0E00000000000000UL = 0UL
+                    && not (isAttacked pos 60 White)
+                    && not (isAttacked pos 59 White)
+                    && not (isAttacked pos 58 White)
+                else false
+            | FlagEnPassant ->
+                pt = Pawn
+                && pos.Ep >= 0
+                && toSq = pos.Ep
+                && pawnAttacks.[us ^^^ 1].[pos.Ep] &&& bit fromSq <> 0UL
+            | FlagPromo ->
+                if pt <> Pawn then false
+                else
+                    let lastRank = if us = White then toSq >= 56 else toSq <= 7
+                    let step = if us = White then toSq - fromSq else fromSq - toSq
+                    lastRank
+                    && ((step = 8 && dst < 0)
+                        || ((step = 7 || step = 9) && dstEnemy
+                            && pawnAttacks.[us].[fromSq] &&& bit toSq <> 0UL))
+            | _ ->
+                if flag <> FlagNormal then false
+                elif dstOwn then false
+                else
+                    match pt with
+                    | 0 ->   // pawn: push, double push, or capture — never to last rank
+                        let lastRank = if us = White then toSq >= 56 else toSq <= 7
+                        if lastRank then false
+                        else
+                            let step = if us = White then toSq - fromSq else fromSq - toSq
+                            if step = 8 then dst < 0
+                            elif step = 16 then
+                                let startRank = if us = White then fromSq < 16 else fromSq >= 48
+                                let mid = if us = White then fromSq + 8 else fromSq - 8
+                                startRank && dst < 0 && pos.Mailbox.[mid] < 0
+                            elif step = 7 || step = 9 then
+                                dstEnemy && pawnAttacks.[us].[fromSq] &&& bit toSq <> 0UL
+                            else false
+                    | 1 -> knightAttacks.[fromSq] &&& bit toSq <> 0UL
+                    | 2 -> bishopAttacks fromSq occ &&& bit toSq <> 0UL
+                    | 3 -> rookAttacks fromSq occ &&& bit toSq <> 0UL
+                    | 4 -> queenAttacks fromSq occ &&& bit toSq <> 0UL
+                    | _ -> kingAttacks.[fromSq] &&& bit toSq <> 0UL
+
 /// Captures, en passant and queen promotions only (quiescence)
 let generateCaptures (pos: Position) (moves: Move[]) : int =
     let us = pos.Stm
