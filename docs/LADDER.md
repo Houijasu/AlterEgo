@@ -36,3 +36,11 @@ Ladder rungs need 64 games each to resolve deltas under ~100 Elo.
 Promoted package (commit `41a8745`): 78.1% @2600 (~2821), 15.6% @2900 (~2607).
 Direct A/B evidence behind the package: net7 +60 (64g), singular +38 (128g).
 Absolute anchor: **≈2760–2820 ± 100** at 16-game rung resolution.
+
+## Smoke — 2026-06-11 (LMP promoted, lmpbase=2)
+
+Direct A/B evidence: LMP +58 (128g), lmpbase=2 +24 over lmpbase=3 (128g).
+SF smoke rungs: 62.5% @2600, 21.9% @2900 — within rung noise of Anchor 3.
+Cumulative direct-A/B gains since first anchor ≈ +140; ladder confirmation
+needs 64-game rungs (self-play gains also typically compress vs external
+opponents). Bench signature with full stack: 367,191 nodes.
