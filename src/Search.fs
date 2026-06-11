@@ -136,7 +136,7 @@ let private corrDiv = tuned "corrdiv" 16        // correction strength divisor
 let private corrW = tuned "corrw" 16            // correction update weight cap
 let private pcMargin = tuned "pcmargin" 160     // probcut beta margin
 let private pcDepthGate = tuned "pcdepth" 5     // probcut minimum depth
-let private lmpBase = tuned "lmpbase" 3         // LMP threshold: base + depth^2
+let private lmpBase = tuned "lmpbase" 2         // LMP threshold: base + depth^2 (2 = SPRT winner)
 let private lmpMaxDepth = tuned "lmpdepth" 8    // LMP maximum depth
 
 // log-based late-move-reduction table
