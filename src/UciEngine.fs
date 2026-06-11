@@ -14,6 +14,10 @@ type Engine(path: string, options: (string * string) list) =
         psi.RedirectStandardError <- true
         psi.UseShellExecute <- false
         psi.CreateNoWindow <- true
+        // reference engines must run their compiled defaults: never inherit the
+        // parent's feature flags (same-binary A/B tests would silently match)
+        for k in [ "ALTEREGO_ENABLE"; "ALTEREGO_DISABLE"; "ALTEREGO_TUNE" ] do
+            psi.EnvironmentVariables.Remove k |> ignore
     let proc = Process.Start psi
 
     let send (s: string) =

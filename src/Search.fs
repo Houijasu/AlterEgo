@@ -96,7 +96,7 @@ let ensureHelpers (st: State) =
         for h in st.HelperStates do h.Tt <- st.Tt
 
 // Search features ship default-on only once individually SPRT-proven.
-// Promoted: singular (+38 Elo @128 games, tuned margins, 2026-06-10).
+// Promoted: singular (+38 @128g, 2026-06-10), lmp (+58 @128g, 2026-06-11).
 // Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist.
 // Promoted features can be switched off via ALTEREGO_DISABLE for A/B runs.
 let private parseSet (envVar: string) =
@@ -111,6 +111,7 @@ let private useProbcut = enabled.Contains "probcut"
 let private useSingular = not (disabled.Contains "singular")
 let private useCorrHist = enabled.Contains "corrhist"
 let private useContHist = enabled.Contains "conthist"
+let private useLmp = not (disabled.Contains "lmp")
 
 // margin knobs for tuning sweeps: ALTEREGO_TUNE=sbetamult=3,corrdiv=32,pcmargin=200
 let private tune =
@@ -135,6 +136,8 @@ let private corrDiv = tuned "corrdiv" 16        // correction strength divisor
 let private corrW = tuned "corrw" 16            // correction update weight cap
 let private pcMargin = tuned "pcmargin" 160     // probcut beta margin
 let private pcDepthGate = tuned "pcdepth" 5     // probcut minimum depth
+let private lmpBase = tuned "lmpbase" 3         // LMP threshold: base + depth^2
+let private lmpMaxDepth = tuned "lmpdepth" 8    // LMP maximum depth
 
 // log-based late-move-reduction table
 let private lmrTable =
@@ -386,9 +389,17 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                 let m = moves.[i]
                                 let mScore = scores.[i]
                                 let quiet = not (isCapture pos m) && moveFlag m <> FlagPromo
+                                // late move pruning: enough legal moves searched at
+                                // shallow depth => remaining quiets are skipped
+                                let lmpSkip =
+                                    useLmp && quiet && not inChk && not isRoot
+                                    && depth <= lmpMaxDepth
+                                    && not (isMateScore alpha)
+                                    && legalCount >= lmpBase + depth * depth
                                 let skipMove =
                                     m = excluded
                                     || (futilityOk && quiet && legalCount > 0)
+                                    || lmpSkip
                                 if not skipMove then
                                     st.ContIdx.[ply + 1] <- moveContIdx pos m
                                     makeMove pos m
