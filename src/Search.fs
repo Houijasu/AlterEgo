@@ -112,6 +112,7 @@ let private useSingular = not (disabled.Contains "singular")
 let private useCorrHist = enabled.Contains "corrhist"
 let private useContHist = enabled.Contains "conthist"
 let private useLmp = not (disabled.Contains "lmp")
+let private useSeeQuiet = enabled.Contains "seequiet"
 
 // margin knobs for tuning sweeps: ALTEREGO_TUNE=sbetamult=3,corrdiv=32,pcmargin=200
 let private tune =
@@ -138,6 +139,8 @@ let private pcMargin = tuned "pcmargin" 160     // probcut beta margin
 let private pcDepthGate = tuned "pcdepth" 5     // probcut minimum depth
 let private lmpBase = tuned "lmpbase" 2         // LMP threshold: base + depth^2 (2 = SPRT winner)
 let private lmpMaxDepth = tuned "lmpdepth" 8    // LMP maximum depth
+let private seeQMargin = tuned "seeqmargin" 60  // SEE quiet pruning: cp lost per depth
+let private seeQDepth = tuned "seeqdepth" 8     // SEE quiet pruning maximum depth
 
 // log-based late-move-reduction table
 let private lmrTable =
@@ -396,10 +399,19 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                     && depth <= lmpMaxDepth
                                     && not (isMateScore alpha)
                                     && legalCount >= lmpBase + depth * depth
+                                // SEE pruning: skip quiets that lose material on arrival
+                                // (seeGe last — it's the costly test, && short-circuits)
+                                let seeSkip =
+                                    useSeeQuiet && quiet && not inChk && not isRoot
+                                    && depth <= seeQDepth
+                                    && legalCount > 0
+                                    && not (isMateScore alpha)
+                                    && not (seeGe pos m (-(seeQMargin * depth)))
                                 let skipMove =
                                     m = excluded
                                     || (futilityOk && quiet && legalCount > 0)
                                     || lmpSkip
+                                    || seeSkip
                                 if not skipMove then
                                     st.ContIdx.[ply + 1] <- moveContIdx pos m
                                     makeMove pos m
