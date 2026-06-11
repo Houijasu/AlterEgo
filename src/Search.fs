@@ -101,8 +101,8 @@ let ensureHelpers (st: State) =
 
 // Search features ship default-on only once individually SPRT-proven.
 // Promoted: singular (+38 @128g), lmp (+58 @128g, base2 +24), improving (+24 @128g),
-//           qstt (+27 @192g).
-// Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist, seequiet, qschecks.
+//           qstt (+27 @192g), qschecks (+45 @192g).
+// Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist, seequiet.
 // Promoted features can be switched off via ALTEREGO_DISABLE for A/B runs.
 let private parseSet (envVar: string) =
     match System.Environment.GetEnvironmentVariable envVar with
@@ -120,7 +120,7 @@ let private useLmp = not (disabled.Contains "lmp")
 let private useSeeQuiet = enabled.Contains "seequiet"
 let private useImproving = not (disabled.Contains "improving")
 let private useQsTT = not (disabled.Contains "qstt")
-let private useQsChecks = enabled.Contains "qschecks"
+let private useQsChecks = not (disabled.Contains "qschecks")
 
 // margin knobs for tuning sweeps: ALTEREGO_TUNE=sbetamult=3,corrdiv=32,pcmargin=200
 let private tune =
