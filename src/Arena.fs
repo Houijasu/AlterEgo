@@ -47,16 +47,35 @@ let SprtUpper = 2.94    // accept H1 (alpha = 0.05)
 [<Literal>]
 let SprtLower = -2.94   // accept H0 (beta = 0.05)
 
-// short, balanced opening lines (UCI moves from startpos)
-let private openings =
-    [| "e2e4 e7e5 g1f3 b8c6"
-       "d2d4 d7d5 c2c4 e7e6"
-       "g1f3 g8f6 c2c4 c7c5"
-       "e2e4 c7c5 g1f3 d7d6"
-       "d2d4 g8f6 c2c4 e7e6"
-       "e2e4 e7e6 d2d4 d7d5"
-       "c2c4 e7e5 b1c3 g8f6"
-       "d2d4 d7d5 g1f3 g8f6" |]
+// short, balanced opening lines (UCI moves from startpos) — 24 distinct lines
+// keep gauntlet game pairs decorrelated (8 lines replayed 12x/color overstated LLR)
+// public: the test suite verifies every line is legal (a bad line kills lanes)
+let openings =
+    [| "e2e4 e7e5 g1f3 b8c6"      // Open Game
+       "d2d4 d7d5 c2c4 e7e6"      // QGD
+       "g1f3 g8f6 c2c4 c7c5"      // English/symmetric
+       "e2e4 c7c5 g1f3 d7d6"      // Sicilian Najdorf-ish
+       "d2d4 g8f6 c2c4 e7e6"      // Nimzo/QID complex
+       "e2e4 e7e6 d2d4 d7d5"      // French
+       "c2c4 e7e5 b1c3 g8f6"      // Reversed Sicilian
+       "d2d4 d7d5 g1f3 g8f6"      // QP symmetric
+       "e2e4 c7c6 d2d4 d7d5"      // Caro-Kann
+       "e2e4 c7c5 g1f3 b8c6"      // Sicilian Old
+       "e2e4 c7c5 g1f3 e7e6"      // Sicilian Taimanov
+       "e2e4 e7e5 g1f3 g8f6"      // Petrov
+       "d2d4 g8f6 c2c4 g7g6"      // KID/Gruenfeld
+       "d2d4 d7d5 c2c4 c7c6"      // Slav
+       "d2d4 g8f6 g1f3 e7e6"      // QP flexible
+       "c2c4 g8f6 b1c3 e7e6"      // English/Nimzo setup
+       "g1f3 d7d5 c2c4 e7e6"      // Reti
+       "e2e4 d7d5 e4d5 g8f6"      // Scandinavian Modern
+       "e2e4 d7d6 d2d4 g8f6"      // Pirc
+       "d2d4 f7f5 g2g3 g8f6"      // Dutch
+       "d2d4 g8f6 c2c4 c7c5"      // Benoni
+       "e2e4 g7g6 d2d4 f8g7"      // Modern
+       "c2c4 c7c5 g1f3 g8f6"      // Symmetric English
+       "e2e4 e7e5 f1c4 g8f6"      // Italian/Two Knights
+    |]
 
 let private applyMoves (pos: Position) (moveStr: string) =
     for tok in moveStr.Split(' ') do

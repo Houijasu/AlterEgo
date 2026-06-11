@@ -65,7 +65,9 @@ let think (pos: Position) (st: State) (budgetMs: int64) (verbose: bool) : Move =
             arms.Add arm
 
         let remaining = budgetMs - swTotal.ElapsedMilliseconds - 20L
-        if remaining < 50L || obj.ReferenceEquals(leader, null) || idDepth < 4 then
+        // an external stop/quit during the seed must end the move NOW — only the
+        // soft-stop may fund Phase 2 (Stop is set by both; Abort disambiguates)
+        if st.Abort.Value || remaining < 50L || obj.ReferenceEquals(leader, null) || idDepth < 4 then
             if verbose then
                 printfn "info string machine verdict %s (seed only) depth %d cp %d"
                     (moveToUci idMove) idDepth idScore

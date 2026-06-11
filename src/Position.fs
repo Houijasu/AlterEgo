@@ -160,6 +160,13 @@ let isAttacked (pos: Position) (sq: int) (by: int) =
 let inline inCheck (pos: Position) =
     isAttacked pos (kingSquare pos pos.Stm) (pos.Stm ^^^ 1)
 
+/// Hash the ep square only when `capturer` has a pawn that can actually take it:
+/// positions whose ep right is immaterial then share a key (better TT sharing and
+/// repetition detection). Board state is identical at set- and clear-time, so the
+/// recomputed test can never desync the key.
+let inline private epHashable (pos: Position) (capturer: int) =
+    pawnAttacks.[capturer ^^^ 1].[pos.Ep] &&& pos.ByPiece.[capturer * 6 + Pawn] <> 0UL
+
 // Castling-rights mask per square: rights removed when a piece moves from/to the square
 let castleMask =
     let m = Array.create 64 15
@@ -199,7 +206,7 @@ let makeMove (pos: Position) (m: Move) =
           Key = pos.Key }
     pos.Ply <- pos.Ply + 1
 
-    if pos.Ep >= 0 then pos.Key <- pos.Key ^^^ Zobrist.epFile.[fileOf pos.Ep]
+    if pos.Ep >= 0 && epHashable pos us then pos.Key <- pos.Key ^^^ Zobrist.epFile.[fileOf pos.Ep]
     pos.Ep <- -1
 
     if flag = FlagEnPassant then
@@ -229,7 +236,7 @@ let makeMove (pos: Position) (m: Move) =
     let isPawn = pieceType piece = Pawn
     if isPawn && abs (toSq - fromSq) = 16 then
         pos.Ep <- (fromSq + toSq) / 2
-        pos.Key <- pos.Key ^^^ Zobrist.epFile.[fileOf pos.Ep]
+        if epHashable pos them then pos.Key <- pos.Key ^^^ Zobrist.epFile.[fileOf pos.Ep]
 
     pos.Half <- if isPawn || captured >= 0 then 0 else pos.Half + 1
     if us = Black then pos.Full <- pos.Full + 1
@@ -289,7 +296,7 @@ let makeNull (pos: Position) =
           Half = pos.Half
           Key = pos.Key }
     pos.Ply <- pos.Ply + 1
-    if pos.Ep >= 0 then pos.Key <- pos.Key ^^^ Zobrist.epFile.[fileOf pos.Ep]
+    if pos.Ep >= 0 && epHashable pos pos.Stm then pos.Key <- pos.Key ^^^ Zobrist.epFile.[fileOf pos.Ep]
     pos.Ep <- -1
     pos.Half <- pos.Half + 1
     pos.Stm <- pos.Stm ^^^ 1
@@ -362,7 +369,7 @@ let setFen (pos: Position) (fen: string) =
     pos.Key <- pos.Key ^^^ Zobrist.castling.[pos.Castling]
     // en passant
     pos.Ep <- if parts.Length > 3 && parts.[3] <> "-" then parseSquare parts.[3] else -1
-    if pos.Ep >= 0 then pos.Key <- pos.Key ^^^ Zobrist.epFile.[fileOf pos.Ep]
+    if pos.Ep >= 0 && epHashable pos pos.Stm then pos.Key <- pos.Key ^^^ Zobrist.epFile.[fileOf pos.Ep]
     // clocks
     pos.Half <- if parts.Length > 4 then int parts.[4] else 0
     pos.Full <- if parts.Length > 5 then int parts.[5] else 1

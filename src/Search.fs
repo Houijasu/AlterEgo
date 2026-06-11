@@ -43,6 +43,7 @@ type State =
     { mutable Tt: Table
       mutable Nodes: uint64
       Stop: StopFlag
+      Abort: StopFlag      // external stop/quit: unlike Stop, NEVER reset by search code
       Sw: Stopwatch
       mutable HardMs: int64
       mutable NodeLimit: uint64
@@ -66,10 +67,11 @@ type State =
       mutable HelperStates: State[]
       mutable HelperPositions: Position[] }
 
-let private newState (tt: Table) (stop: StopFlag) =
+let private newState (tt: Table) (stop: StopFlag) (abort: StopFlag) =
     { Tt = tt
       Nodes = 0UL
       Stop = stop
+      Abort = abort
       Sw = Stopwatch()
       HardMs = 0L
       NodeLimit = 0UL
@@ -92,13 +94,13 @@ let private newState (tt: Table) (stop: StopFlag) =
       HelperStates = [||]
       HelperPositions = [||] }
 
-let createState (ttMb: int) = newState (Table ttMb) (StopFlag())
+let createState (ttMb: int) = newState (Table ttMb) (StopFlag()) (StopFlag())
 
 /// Size the cached helper pool to ThreadCount - 1 (idempotent)
 let ensureHelpers (st: State) =
     let need = max 0 (st.ThreadCount - 1)
     if st.HelperStates.Length <> need then
-        st.HelperStates <- Array.init need (fun _ -> newState st.Tt st.Stop)
+        st.HelperStates <- Array.init need (fun _ -> newState st.Tt st.Stop st.Abort)
         st.HelperPositions <- Array.init need (fun _ -> create ())
     else
         for h in st.HelperStates do h.Tt <- st.Tt
@@ -180,7 +182,8 @@ let inline scoreFromTt (s: int) (ply: int) =
 
 let inline private checkUp (st: State) =
     if st.Nodes &&& 2047UL = 0UL then
-        if st.HardMs > 0L && st.Sw.ElapsedMilliseconds >= st.HardMs then st.Stop.Value <- true
+        if st.Abort.Value then st.Stop.Value <- true
+        elif st.HardMs > 0L && st.Sw.ElapsedMilliseconds >= st.HardMs then st.Stop.Value <- true
         elif st.NodeLimit > 0UL && st.Nodes >= st.NodeLimit then st.Stop.Value <- true
 
 let inline private isCapture (pos: Position) (m: Move) =

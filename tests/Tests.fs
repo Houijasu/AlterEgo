@@ -105,6 +105,7 @@ let ``perft kiwipete depth 2`` () =
 let ``make-unmake restores key and accumulators`` () =
     let pos = fromFen StartFen
     let key = pos.Key
+    let pawnKey = pos.PawnKey
     let mg = pos.Mg
     let m = mkMove 12 28   // e2e4
     makeMove pos m
@@ -112,6 +113,7 @@ let ``make-unmake restores key and accumulators`` () =
     Assert.NotEqual<uint64>(key, pos.Key)
     unmakeMove pos m
     Assert.Equal(key, pos.Key)
+    Assert.Equal(pawnKey, pos.PawnKey)
     Assert.Equal(mg, pos.Mg)
     Assert.Equal(0, pos.Ply)
 
@@ -135,7 +137,10 @@ let ``isPseudoLegal equals generator membership over all encodings`` () =
           "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1"
           "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8"
           "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10"
-          "r3k2r/8/8/8/3pP3/8/8/R3K2R b KQkq e3 0 1" ]
+          "r3k2r/8/8/8/3pP3/8/8/R3K2R b KQkq e3 0 1"
+          // impossible-but-encodable: rank-1/8 pawns must not pass as double-pushes
+          "k7/8/8/8/8/8/8/KP6 w - - 0 1"
+          "k6p/8/8/8/8/8/8/K7 b - - 0 1" ]
     let buf = Array.zeroCreate<Move> 256
     for fen in fens do
         let pos = fromFen fen
@@ -159,6 +164,22 @@ let ``isPseudoLegal rejects stale moves after the position changes`` () =
     Assert.False(isPseudoLegal pos e2e4)          // square now empty
     Assert.False(isPseudoLegal pos (mkMove 1 18)) // white knight, black to move
     Assert.True(isPseudoLegal pos (mkMove 52 36)) // e7e5 is black's move
+
+[<Fact>]
+let ``every arena opening line is legal from startpos`` () =
+    let buf = Array.zeroCreate<Move> 256
+    for line in AlterEgo.Arena.openings do
+        let pos = fromFen StartFen
+        for tok in line.Split(' ') do
+            let n = generate pos buf
+            let mutable applied = false
+            let mutable i = 0
+            while not applied && i < n do
+                if moveToUci buf.[i] = tok then
+                    makeMove pos buf.[i]
+                    if wasLegal pos then applied <- true else unmakeMove pos buf.[i]
+                i <- i + 1
+            Assert.True(applied, sprintf "opening move %s unplayable in line '%s'" tok line)
 
 [<Fact>]
 let ``illegal moves are filtered by wasLegal`` () =

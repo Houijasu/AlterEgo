@@ -65,6 +65,7 @@ let run () =
     let mutable worker: Thread = null
 
     let stopSearch () =
+        st.Abort.Value <- true   // distinguishes user stop/quit from internal soft-stop
         st.Stop.Value <- true
         if worker <> null && worker.IsAlive then worker.Join()
 
@@ -133,6 +134,7 @@ let run () =
                     stopSearch ()
                     // reset on the command thread BEFORE the worker exists: a later
                     // "stop" can then never be overwritten by the search thread
+                    st.Abort.Value <- false
                     st.Stop.Value <- false
                     let limits = parseGo pos tokens
                     // MACHINE is the engine's algorithm (hardwired). It allocates a

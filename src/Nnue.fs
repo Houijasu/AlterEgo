@@ -252,7 +252,9 @@ let evaluateAcc (acc: int16[]) (stm: int) : int =
         let stmOff = if stm = White then 0 else HiddenSize
         let oppOff = HiddenSize - stmOff
         let sum = dotHalf acc stmOff n.W2 0 + dotHalf acc oppOff n.W2 HiddenSize
-        (sum + n.B2) * Scale / (QA * QB)
+        let v = (sum + n.B2) * Scale / (QA * QB)
+        // keep static evals out of the mate-score band (|s| > 28744 reads as mate)
+        if v > 27000 then 27000 elif v < -27000 then -27000 else v
 
 /// WDL probabilities from `stm`'s point of view, or ValueNone for v1 nets.
 /// Float math + softmax: probe-root frequency ONLY, never the search hot path.

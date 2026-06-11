@@ -40,10 +40,11 @@ let runSuite (maxDepth: int) =
                     printfn "FAIL  %-9s d%d  got %d, expected %d" name depth got expected
         // incremental accumulators must survive the whole make/unmake walk bit-exactly
         let fresh = fromFen fen
-        if pos.Mg <> fresh.Mg || pos.Eg <> fresh.Eg || pos.Phase <> fresh.Phase || pos.Key <> fresh.Key then
+        if pos.Mg <> fresh.Mg || pos.Eg <> fresh.Eg || pos.Phase <> fresh.Phase
+           || pos.Key <> fresh.Key || pos.PawnKey <> fresh.PawnKey then
             failures <- failures + 1
-            printfn "FAIL  %-9s accumulator drift (mg %d/%d eg %d/%d phase %d/%d)"
-                name pos.Mg fresh.Mg pos.Eg fresh.Eg pos.Phase fresh.Phase
+            printfn "FAIL  %-9s accumulator drift (mg %d/%d eg %d/%d phase %d/%d pawnkey %016X/%016X)"
+                name pos.Mg fresh.Mg pos.Eg fresh.Eg pos.Phase fresh.Phase pos.PawnKey fresh.PawnKey
     sw.Stop()
     let nps = float totalNodes / sw.Elapsed.TotalSeconds / 1_000_000.0
     printfn ""

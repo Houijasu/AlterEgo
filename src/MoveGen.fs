@@ -243,7 +243,11 @@ let isPseudoLegal (pos: Position) (m: Move) : bool =
                             let step = if us = White then toSq - fromSq else fromSq - toSq
                             if step = 8 then dst < 0
                             elif step = 16 then
-                                let startRank = if us = White then fromSq < 16 else fromSq >= 48
+                                // exact generator parity: doubles come from rank 2/7 only —
+                                // a (physically impossible) rank-1/8 pawn must not widen this
+                                let startRank =
+                                    if us = White then fromSq >= 8 && fromSq < 16
+                                    else fromSq >= 48 && fromSq < 56
                                 let mid = if us = White then fromSq + 8 else fromSq - 8
                                 startRank && dst < 0 && pos.Mailbox.[mid] < 0
                             elif step = 7 || step = 9 then
