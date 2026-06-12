@@ -18,6 +18,56 @@ let private H = 256      // hidden size (= Nnue.HiddenSize)
 [<Literal>]
 let private SampleBytes = 100
 
+// ---- sample store: the corpus as 100-byte-aligned slabs ----
+// A single byte[] caps at 2GB (~21M samples); slabs remove the ceiling.
+// Multi-file corpora: '+'-separated paths, each file's trailing partial
+// record dropped INDEPENDENTLY so one short file can't misalign the next.
+[<Literal>]
+let private SamplesPerSlab = 10_000_000   // 1GB per slab
+
+type private Store =
+    { Slabs: byte[][]
+      Total: int }
+
+let inline private slabOf (store: Store) (idx: int) = store.Slabs.[idx / SamplesPerSlab]
+let inline private offOf (idx: int) = (idx % SamplesPerSlab) * SampleBytes
+
+let private loadStore (spec: string) : Store =
+    let paths =
+        spec.Split('+')
+        |> Array.map (fun p -> p.Trim())
+        |> Array.filter (fun p -> p <> "")
+    let counts =
+        paths
+        |> Array.map (fun p ->
+            let len = FileInfo(p).Length
+            if len % int64 SampleBytes <> 0L then
+                printfn "WARNING: %s — %d trailing bytes ignored (truncated mid-record? run scrub)"
+                    p (int (len % int64 SampleBytes))
+            len / int64 SampleBytes)
+    let total = Array.sum counts
+    let slabCount = int ((total + int64 SamplesPerSlab - 1L) / int64 SamplesPerSlab)
+    let slabs =
+        Array.init slabCount (fun i ->
+            let samples = min (int64 SamplesPerSlab) (total - int64 i * int64 SamplesPerSlab)
+            Array.zeroCreate<byte> (int samples * SampleBytes))
+    let mutable next = 0L   // next global sample slot to fill
+    for fi in 0 .. paths.Length - 1 do
+        use fs = File.OpenRead paths.[fi]
+        let mutable remaining = counts.[fi] * int64 SampleBytes
+        while remaining > 0L do
+            let slab = int (next / int64 SamplesPerSlab)
+            let offBytes = int (next % int64 SamplesPerSlab) * SampleBytes
+            let want = int (min (int64 (slabs.[slab].Length - offBytes)) remaining)
+            let mutable got = 0
+            while got < want do
+                let r = fs.Read(slabs.[slab], offBytes + got, want - got)
+                if r <= 0 then failwithf "unexpected EOF reading %s" paths.[fi]
+                got <- got + r
+            next <- next + int64 (want / SampleBytes)
+            remaining <- remaining - int64 want
+    { Slabs = slabs; Total = int total }
+
 // input size is runtime: 768 (flat) / 3072 (own-king) / 6144 (dual-king factorized)
 let mutable private In = 768
 let mutable private buckets = 1
@@ -250,7 +300,7 @@ let private export (net: Net) (path: string) =
 
 /// Forward-only WDL reliability report over the holdout range: 10 bins of
 /// predicted expected score (Pw + Pd/2) vs actual outcome.
-let private calibrationReport (net: Net) (data: byte[]) (fromIdx: int) (toIdx: int) =
+let private calibrationReport (net: Net) (store: Store) (fromIdx: int) (toIdx: int) =
     let fs = Array.zeroCreate 66
     let fo = Array.zeroCreate 66
     let accS = Array.zeroCreate<float32> H
@@ -259,7 +309,8 @@ let private calibrationReport (net: Net) (data: byte[]) (fromIdx: int) (toIdx: i
     let binActual = Array.zeroCreate<float> 10
     let binCount = Array.zeroCreate<int> 10
     for k in fromIdx .. toIdx - 1 do
-        let off = k * SampleBytes
+        let data = slabOf store k
+        let off = offOf k
         let cnt = extractFeatures data off fs fo
         if cnt >= 0 then
             let stm = int data.[off + 96]
@@ -311,11 +362,8 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
     In <- if dual then 6144 else 768 * buckets
     printfn "architecture: (%d -> %d)x2 -> 1  (%d king buckets%s%s)"
         In H buckets (if mirror then ", mirrored" else "") (if dual then ", dual-king factorized" else "")
-    let data = File.ReadAllBytes dataPath
-    let total = data.Length / SampleBytes
-    if data.Length % SampleBytes <> 0 then
-        printfn "WARNING: %d trailing bytes ignored (file is not a multiple of %d — truncated mid-record? run scrub)"
-            (data.Length % SampleBytes) SampleBytes
+    let store = loadStore dataPath
+    let total = store.Total
     let valCount = max 1 (total / 100)
     let trainCount = total - valCount
     printfn "training on %d samples (%d held out), %d epochs" trainCount valCount epochs
@@ -369,7 +417,8 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
                 let hi = min (b + count) (lo + chunk)
                 let mutable loss = 0.0
                 for k in lo .. hi - 1 do
-                    loss <- loss + float (trainSample net g data (perm.[k] * SampleBytes) fs fo accS accO)
+                    let idx = perm.[k]
+                    loss <- loss + float (trainSample net g (slabOf store idx) (offOf idx) fs fo accS accO)
                 losses.[t] <- loss) |> ignore
             // reduce thread gradients into grads.[0]
             let g0 = grads.[0]
@@ -405,12 +454,12 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
         let gDummy = newGrad ()
         let mutable valLoss = 0.0
         for k in trainCount .. total - 1 do
-            valLoss <- valLoss + float (trainSample net gDummy data (k * SampleBytes) fs fo accS accO)
+            valLoss <- valLoss + float (trainSample net gDummy (slabOf store k) (offOf k) fs fo accS accO)
         printfn "epoch %2d  cp %.6f/%.6f  wdl %.4f/%.4f  lr %.5f  (%.0fs)"
             epoch (epochLoss / float trainCount) (valLoss / float valCount)
             (epochWdl / float trainCount) (gDummy.LossWdl / float valCount)
             lr sw.Elapsed.TotalSeconds
         if epoch % 6 = 0 then lr <- lr * 0.5f
         export net outPath
-    calibrationReport net data trainCount total
+    calibrationReport net store trainCount total
     printfn "done in %.0fs" sw.Elapsed.TotalSeconds
