@@ -11,3 +11,6 @@ tools/
 
 # external game corpora and converted samples
 training_data/
+
+# experiment / training logs
+log/

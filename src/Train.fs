@@ -386,6 +386,7 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
     let mutable lr = 0.0015f
 
     let sw = System.Diagnostics.Stopwatch.StartNew()
+    let mutable lastTick = 0.0   // intra-epoch progress, at most every 30s
     for epoch in 1 .. epochs do
         // shuffle
         for i in trainCount - 1 .. -1 .. 1 do
@@ -446,6 +447,11 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
             epochWdl <- epochWdl + g0.LossWdl
             batches <- batches + 1
             b <- b + count
+            if sw.Elapsed.TotalSeconds - lastTick >= 30.0 then
+                lastTick <- sw.Elapsed.TotalSeconds
+                let frac = (float (epoch - 1) + float b / float trainCount) / float epochs
+                printfn "  %.1f%%  elapsed %.0fs  ETA %.0fs"
+                    (frac * 100.0) sw.Elapsed.TotalSeconds (sw.Elapsed.TotalSeconds * (1.0 - frac) / frac)
         // validation
         let fs = Array.zeroCreate 66
         let fo = Array.zeroCreate 66
@@ -455,10 +461,11 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
         let mutable valLoss = 0.0
         for k in trainCount .. total - 1 do
             valLoss <- valLoss + float (trainSample net gDummy (slabOf store k) (offOf k) fs fo accS accO)
-        printfn "epoch %2d  cp %.6f/%.6f  wdl %.4f/%.4f  lr %.5f  (%.0fs)"
-            epoch (epochLoss / float trainCount) (valLoss / float valCount)
+        printfn "epoch %2d/%d  cp %.6f/%.6f  wdl %.4f/%.4f  lr %.5f  (%.0fs  %d%%  ETA %.0fs)"
+            epoch epochs (epochLoss / float trainCount) (valLoss / float valCount)
             (epochWdl / float trainCount) (gDummy.LossWdl / float valCount)
-            lr sw.Elapsed.TotalSeconds
+            lr sw.Elapsed.TotalSeconds (epoch * 100 / epochs)
+            (sw.Elapsed.TotalSeconds / float epoch * float (epochs - epoch))
         if epoch % 6 = 0 then lr <- lr * 0.5f
         export net outPath
     calibrationReport net store trainCount total

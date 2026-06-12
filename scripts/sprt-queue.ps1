@@ -39,26 +39,35 @@ promote only clear positives, one feature at a time (M9 lesson).
 "@ | Set-Content $evidence
 }
 
+$qStart = Get-Date
+$qDone = 0
+$idx = 0
 foreach ($f in $Features) {
+    $idx++
     if (Select-String -Path $evidence -Pattern "\| $commit \| $f \|" -Quiet) {
         Write-Host "skip $f (already logged for $commit)"
         continue
     }
-    Write-Host "=== $f ($Games games) ==="
+    Write-Host "=== [$idx/$($Features.Count)] $f ($Games games) ==="
     $env:ALTEREGO_ENABLE = $f
     if ($Tune) { $env:ALTEREGO_TUNE = $Tune }
     else { Remove-Item Env:\ALTEREGO_TUNE -ErrorAction SilentlyContinue }
 
     # flag-on bench signature, pinned (single-threaded runs crash unpinned on this box)
-    $blog = Join-Path $root "bench_tmp.log"
+    New-Item -ItemType Directory -Force (Join-Path $root "log") | Out-Null
+    $blog = Join-Path $root "log\bench_tmp.log"
     $p = Start-Process -FilePath $exe -ArgumentList "bench" -NoNewWindow -PassThru -RedirectStandardOutput $blog
     $p.ProcessorAffinity = 0x10
     $p.WaitForExit()
     $sig = if ((Get-Content $blog -Tail 1) -match 'bench: (\d+) nodes') { $Matches[1] } else { "?" }
     Remove-Item $blog
 
-    $out = & $exe cage $Games $Ms $Net $Opponent $Lanes 2>&1
-    $res = ($out | Where-Object { $_ -match '^cage result:' } | Select-Object -Last 1)
+    # stream the gauntlet live — per-game lines carry [%, ETA] from the arena
+    $res = $null
+    & $exe cage $Games $Ms $Net $Opponent $Lanes 2>&1 | ForEach-Object {
+        if ($_ -match '^cage result:') { $res = "$_" }
+        Write-Host "  $_"
+    }
     $date = Get-Date -Format yyyy-MM-dd
     if ($res -match 'cage result: \+(\d+) =(\d+) -(\d+) \((\d+) games\)\s+score ([\d.]+)%\s+elo ([+-]?\d+)\s+LLR ([+-]?[\d.]+)') {
         $row = "| $date | $commit | $f | $Tune | $($Matches[4]) | +$($Matches[1])=$($Matches[2])-$($Matches[3]) | $($Matches[5])% | $($Matches[6]) | $($Matches[7]) | $sig |"
@@ -67,6 +76,13 @@ foreach ($f in $Features) {
     }
     Add-Content $evidence $row
     Write-Host $row
+    $qDone++
+    $remaining = $Features.Count - $idx
+    if ($remaining -gt 0) {
+        $perFeature = ((Get-Date) - $qStart).TotalMinutes / $qDone
+        Write-Host ("queue: {0}/{1} done  [{2}%  ETA {3:N0}m]" -f $idx, $Features.Count,
+            [int](100 * $idx / $Features.Count), ($perFeature * $remaining))
+    }
 }
 Remove-Item Env:\ALTEREGO_ENABLE -ErrorAction SilentlyContinue
 Remove-Item Env:\ALTEREGO_TUNE -ErrorAction SilentlyContinue

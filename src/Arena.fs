@@ -210,6 +210,13 @@ let runGauntlet (extPath: string) (extOptions: (string * string) list)
     let earlyStop = [| false |]
     let laneFailures = [| 0 |]
     let mutable score = 0.0
+    let sw = System.Diagnostics.Stopwatch.StartNew()
+    let progress (played: int) =
+        if played <= 0 || played >= games then ""
+        else
+            let rem = sw.Elapsed.TotalSeconds / float played * float (games - played)
+            sprintf "  [%d%%  ETA %s]" (played * 100 / games)
+                (if rem >= 90.0 then sprintf "%.0fm" (rem / 60.0) else sprintf "%.0fs" rem)
     printfn "cage: AlterEgo%s vs %s — %d games at %dms/move, %d lanes"
         (if useMachine then "(MACHINE)" else "") extPath games moveMs lanes
     let worker () =
@@ -228,10 +235,11 @@ let runGauntlet (extPath: string) (extOptions: (string * string) list)
                     elif pts > 0.25 then tally.[1] <- tally.[1] + 1
                     else tally.[2] <- tally.[2] + 1
                     let llr = sprtLlr tally.[0] tally.[1] tally.[2] 0.0 5.0
-                    printfn "game %2d  [AlterEgo as %s]  %s   +%d =%d -%d  LLR %+.2f"
+                    printfn "game %2d  [AlterEgo as %s]  %s   +%d =%d -%d  LLR %+.2f%s"
                         (g + 1) (if weAreWhite then "W" else "B")
                         (if pts > 0.75 then "WIN" elif pts > 0.25 then "draw" else "loss")
                         tally.[0] tally.[1] tally.[2] llr
+                        (progress (tally.[0] + tally.[1] + tally.[2]))
                     if llr >= SprtUpper || llr <= SprtLower then
                         System.Threading.Volatile.Write(&earlyStop.[0], true))
                 g <- System.Threading.Interlocked.Increment(&nextGame.[0])
@@ -274,6 +282,13 @@ let runMatch (kindA: PlayerKind) (kindB: PlayerKind) (games: int) (moveMs: int64
     let mutable winsA = 0
     let mutable winsB = 0
     let mutable draws = 0
+    let sw = System.Diagnostics.Stopwatch.StartNew()
+    let progress (played: int) =
+        if played <= 0 || played >= games then ""
+        else
+            let rem = sw.Elapsed.TotalSeconds / float played * float (games - played)
+            sprintf "  [%d%%  ETA %s]" (played * 100 / games)
+                (if rem >= 90.0 then sprintf "%.0fm" (rem / 60.0) else sprintf "%.0fs" rem)
     let nameOf k = match k with Ego -> "Ego" | Machine -> "MACHINE"
     printfn "match: %s vs %s — %d games at %dms/move, %d lanes" (nameOf kindA) (nameOf kindB) games moveMs lanes
     let worker () =
@@ -296,8 +311,9 @@ let runMatch (kindA: PlayerKind) (kindB: PlayerKind) (games: int) (moveMs: int64
                         | WhiteWins, false | BlackWins, true -> winsB <- winsB + 1; "0-1 (B)"
                         | Draw, _ -> draws <- draws + 1; "1/2"
                     let llr = sprtLlr winsA draws winsB 0.0 5.0
-                    printfn "game %2d  [%s as %s]  %s   +%d =%d -%d  LLR %+.2f"
+                    printfn "game %2d  [%s as %s]  %s   +%d =%d -%d  LLR %+.2f%s"
                         (g + 1) (nameOf kindA) (if aIsWhite then "W" else "B") aPoint winsA draws winsB llr
+                        (progress (winsA + draws + winsB))
                     if llr >= SprtUpper || llr <= SprtLower then
                         System.Threading.Volatile.Write(&earlyStop.[0], true))
                 g <- System.Threading.Interlocked.Increment(&nextGame.[0])
