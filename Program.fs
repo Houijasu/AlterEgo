@@ -144,6 +144,18 @@ let private dispatch argv =
             printfn "datagen with NNUE %s" (defaultArg netFile "<embedded>")
             AlterEgo.Datagen.run (int games) (uint64 nodes) out lanes
             0
+    // pgnconv <pgn> <out> [nodes] [lanes] — PGN games -> labeled training samples
+    | [| "pgnconv"; pgnPath; out |]
+    | [| "pgnconv"; pgnPath; out; _ |]
+    | [| "pgnconv"; pgnPath; out; _; _ |] ->
+        AlterEgo.Magics.init ()
+        if not (AlterEgo.Nnue.active || AlterEgo.Nnue.loadEmbedded ()) then
+            printfn "FATAL: no embedded NNUE network"
+            exit 1
+        let nodes = if argv.Length > 3 then uint64 argv.[3] else 8000UL
+        let lanes = if argv.Length > 4 then int argv.[4] else max 1 (System.Environment.ProcessorCount / 2 - 1)
+        AlterEgo.Pgn.run pgnPath out nodes lanes
+        0
     | [| "train"; dataFile; epochs; out |] ->
         AlterEgo.Train.run dataFile (int epochs) out 4
         0

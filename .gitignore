@@ -8,3 +8,6 @@ data/
 
 # external engines
 tools/
+
+# external game corpora and converted samples
+training_data/

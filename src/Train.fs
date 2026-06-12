@@ -313,6 +313,9 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
         In H buckets (if mirror then ", mirrored" else "") (if dual then ", dual-king factorized" else "")
     let data = File.ReadAllBytes dataPath
     let total = data.Length / SampleBytes
+    if data.Length % SampleBytes <> 0 then
+        printfn "WARNING: %d trailing bytes ignored (file is not a multiple of %d — truncated mid-record? run scrub)"
+            (data.Length % SampleBytes) SampleBytes
     let valCount = max 1 (total / 100)
     let trainCount = total - valCount
     printfn "training on %d samples (%d held out), %d epochs" trainCount valCount epochs
@@ -328,7 +331,9 @@ let run (dataPath: string) (epochs: int) (outPath: string) (kingBuckets: int) =
 
     let threads = max 1 (Environment.ProcessorCount - 1)
     let grads = Array.init threads (fun _ -> newGrad ())
-    let batchSize = 16384
+    // tiny datasets: one giant batch would mean a single Adam step per epoch;
+    // keep >=8 steps per epoch (no-op for every dataset >= 128K samples)
+    let batchSize = min 16384 (max 256 ((trainCount + 7) / 8))
     let perm = Array.init trainCount id
     let mutable lr = 0.0015f
 
