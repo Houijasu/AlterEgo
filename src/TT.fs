@@ -1,5 +1,7 @@
 module AlterEgo.TT
 
+#nowarn "9"   // NativePtr in Prefetch: address-of on a pinned array element
+
 // Lock-free shared transposition table (lazy SMP). Clustered: 4 entries per
 // bucket, one 64-byte cache line. Each entry is two words: (key XOR data,
 // data). A torn write from concurrent threads makes the XOR validation fail,
@@ -65,9 +67,31 @@ type Table(sizeMb: int) =
     /// Bump once per search so replacement can age out stale entries.
     member _.NewSearch() = generation <- (generation + 1) &&& 0xFF
 
+    /// Per-mille occupancy estimate over a strided whole-table sample.
+    /// Counts ANY stored entry — the user-facing question is "how full is my
+    /// hash", which persists across moves (gen-filtering made every new search
+    /// report ~0 despite a table full of reusable entries).
+    member _.Hashfull() =
+        let sample = min 4000 entries.Length
+        let stride = max 1 (entries.Length / sample)
+        let mutable filled = 0
+        let mutable i = 0
+        for _ in 1 .. sample do
+            if entries.[i].Data <> 0UL then filled <- filled + 1
+            i <- i + stride
+        filled * 1000 / max 1 sample
+
     member _.Clear() =
         System.Array.Clear(entries, 0, entries.Length)
         generation <- 0
+
+    /// Hint the CPU to pull the key's bucket (one cache line) before the
+    /// probe that follows the child search setup. Pure hint: no state change.
+    member _.Prefetch(key: uint64) =
+        if System.Runtime.Intrinsics.X86.Sse.IsSupported then
+            let b = int (key &&& mask) * BucketSize
+            use p = fixed &entries.[b]
+            System.Runtime.Intrinsics.X86.Sse.Prefetch0(Microsoft.FSharp.NativeInterop.NativePtr.toVoidPtr p)
 
     member _.Probe(key: uint64) : TTResult =
         let b = int (key &&& mask) * BucketSize

@@ -26,10 +26,13 @@ type Limits =
       IncMs: int64
       MovesToGo: int
       NodeLimit: uint64
-      Infinite: bool }
+      Infinite: bool
+      MateIn: int          // go mate N: stop once a mate in <= N moves is proven
+      SearchMoves: Move[] } // go searchmoves: restrict the root (empty = all)
 
 let defaultLimits =
-    { Depth = 0; MoveTimeMs = 0L; TimeMs = 0L; IncMs = 0L; MovesToGo = 0; NodeLimit = 0UL; Infinite = false }
+    { Depth = 0; MoveTimeMs = 0L; TimeMs = 0L; IncMs = 0L; MovesToGo = 0; NodeLimit = 0UL
+      Infinite = false; MateIn = 0; SearchMoves = [||] }
 
 /// Shared stop signal — volatile so helper threads observe main-thread writes
 type StopFlag() =
@@ -52,6 +55,9 @@ type State =
       CorrHist: int[]        // [stm * 16384 + (pawnKey & 16383)] — eval correction
       ContHist: int[]        // [(prevPiece*64+prevTo) * 768 + piece*64+to] — continuation
       CaptHist: int[]        // [(piece*64+to) * 6 + victimType] — capture ordering
+      CounterMove: Move[]    // [prevPiece*64+prevTo] — quiet refutation of the previous move
+      EvalKeys: uint64[]     // evalcache: full position key per slot
+      EvalVals: int[]        // evalcache: raw NNUE eval per slot
       ContIdx: int[]         // per-ply: previous move's piece*64+to, or -1 (null/root)
       EvalStack: int[]       // per-ply static eval (MinValue = in check / unknown)
       Buffers: Move[][]
@@ -62,6 +68,9 @@ type State =
       mutable BestMove: Move
       mutable BestScore: int
       mutable CompletedDepth: int
+      mutable SelDepth: int      // deepest ply reached this iteration (info seldepth)
+      mutable ReportRoot: bool   // verbose root search: emit currmove lines after 3s
+      mutable RootFilter: Move[] // searchmoves restriction (empty = all)
       // lazy SMP: cached helper resources (zero per-move allocation)
       mutable ThreadCount: int
       mutable HelperStates: State[]
@@ -80,6 +89,9 @@ let private newState (tt: Table) (stop: StopFlag) (abort: StopFlag) =
       CorrHist = Array.zeroCreate (2 * 16384)
       ContHist = Array.zeroCreate (768 * 768)
       CaptHist = Array.zeroCreate (768 * 6)
+      CounterMove = Array.zeroCreate 768
+      EvalKeys = Array.zeroCreate 131072
+      EvalVals = Array.zeroCreate 131072
       ContIdx = Array.create (MaxPly + 2) -1
       EvalStack = Array.create (MaxPly + 2) System.Int32.MinValue
       Buffers = Array.init MaxPly (fun _ -> Array.zeroCreate<Move> 256)
@@ -90,11 +102,28 @@ let private newState (tt: Table) (stop: StopFlag) (abort: StopFlag) =
       BestMove = NoMove
       BestScore = 0
       CompletedDepth = 0
+      SelDepth = 0
+      ReportRoot = false
+      RootFilter = [||]
       ThreadCount = 1
       HelperStates = [||]
       HelperPositions = [||] }
 
 let createState (ttMb: int) = newState (Table ttMb) (StopFlag()) (StopFlag())
+
+/// UCI_ShowWDL: append calibrated win/draw/loss to info lines (GUI feature)
+let mutable showWdl = false
+
+/// " wdl <w> <d> <l>" per mille from stm's POV — a static probe of the WDL
+/// head at the given position. Empty when off or the net has no head (v1).
+let wdlInfoString (pos: Position) =
+    if not showWdl then ""
+    else
+        match AlterEgo.Nnue.evaluateWdl pos.AccStack.[pos.Ply] pos.Stm with
+        | ValueSome (struct (w, d, l)) ->
+            sprintf " wdl %d %d %d"
+                (int (w * 1000.0f + 0.5f)) (int (d * 1000.0f + 0.5f)) (int (l * 1000.0f + 0.5f))
+        | ValueNone -> ""
 
 /// Size the cached helper pool to ThreadCount - 1 (idempotent)
 let ensureHelpers (st: State) =
@@ -113,43 +142,37 @@ let ensureHelpers (st: State) =
 // Unproven (opt-in via ALTEREGO_ENABLE): probcut, corrhist, conthist, seequiet,
 //           staged (+4 @192g = neutral, parked).
 // Promoted features can be switched off via ALTEREGO_DISABLE for A/B runs.
-let private parseSet (envVar: string) =
-    match System.Environment.GetEnvironmentVariable envVar with
-    | null -> Set.empty
-    | s -> s.Split(',') |> Array.map (fun x -> x.Trim().ToLowerInvariant()) |> Set.ofArray
-
-let private enabled = parseSet "ALTEREGO_ENABLE"
-let private disabled = parseSet "ALTEREGO_DISABLE"
-
-let private useProbcut = enabled.Contains "probcut"
-let private useSingular = not (disabled.Contains "singular")
-let private useCorrHist = enabled.Contains "corrhist"
-let private useContHist = enabled.Contains "conthist"
-let private useLmp = not (disabled.Contains "lmp")
-let private useSeeQuiet = enabled.Contains "seequiet"
-let private useImproving = not (disabled.Contains "improving")
-let private useQsTT = not (disabled.Contains "qstt")
-let private useQsChecks = not (disabled.Contains "qschecks")
-let private useCutLmr = not (disabled.Contains "cutlmr")
-let private useCaptHist = not (disabled.Contains "capthist")
-let private useStaged = enabled.Contains "staged"
+// Flags/knobs are bound as statics from SearchConfig (single owner of the env).
+let private useProbcut = SearchConfig.optIn "probcut"
+let private useSingular = SearchConfig.promoted "singular"
+let private useCorrHist = SearchConfig.optIn "corrhist"
+let private useContHist = SearchConfig.optIn "conthist"
+let private useLmp = SearchConfig.promoted "lmp"
+let private useSeeQuiet = SearchConfig.optIn "seequiet"
+let private useImproving = SearchConfig.promoted "improving"
+let private useQsTT = SearchConfig.promoted "qstt"
+let private useQsChecks = SearchConfig.promoted "qschecks"
+let private useCutLmr = SearchConfig.promoted "cutlmr"
+let private useCaptHist = SearchConfig.promoted "capthist"
+let private useStaged = SearchConfig.optIn "staged"
+// Tier 1/2 depth batch (2026-06-12), each pending solo SPRT:
+let private useIir = SearchConfig.optIn "iir"
+let private useHistLmr = SearchConfig.optIn "histlmr"
+let private useNmp2 = SearchConfig.optIn "nmp2"
+let private useSext2 = SearchConfig.optIn "sext2"
+let private useCounterMove = SearchConfig.optIn "countermove"
+let private useSeeCapt = SearchConfig.optIn "seecapt"
+let private useEvalCache = SearchConfig.optIn "evalcache"
+// Codex-review batch (2026-06-12), each pending solo SPRT:
+let private useRazor = SearchConfig.optIn "razor"
+let private useMdp = SearchConfig.optIn "mdp"
+let private useHistGravity = SearchConfig.optIn "histgravity"
+let private useCaptLmr = SearchConfig.optIn "captlmr"
+let private useTtPrefetch = SearchConfig.optIn "ttprefetch"
+let private useTmStab = SearchConfig.optIn "tmstab"
 
 // margin knobs for tuning sweeps: ALTEREGO_TUNE=sbetamult=3,corrdiv=32,pcmargin=200
-let private tune =
-    match System.Environment.GetEnvironmentVariable "ALTEREGO_TUNE" with
-    | null -> Map.empty
-    | s ->
-        s.Split(',')
-        |> Array.choose (fun kv ->
-            match kv.Split('=') with
-            | [| k; v |] ->
-                match System.Int32.TryParse(v.Trim()) with
-                | true, n -> Some (k.Trim().ToLowerInvariant(), n)
-                | _ -> None
-            | _ -> None)
-        |> Map.ofArray
-
-let private tuned key dflt = tune |> Map.tryFind key |> Option.defaultValue dflt
+let private tuned = SearchConfig.tuned
 
 let private sBetaMult = tuned "sbetamult" 3     // singular margin: ttScore - mult*depth (3 = SPRT winner)
 let private sDepthGate = tuned "sdepth" 6       // singular minimum depth (6 = SPRT winner)
@@ -162,6 +185,21 @@ let private lmpMaxDepth = tuned "lmpdepth" 8    // LMP maximum depth
 let private seeQMargin = tuned "seeqmargin" 60  // SEE quiet pruning: cp lost per depth
 let private seeQDepth = tuned "seeqdepth" 8     // SEE quiet pruning maximum depth
 let private cutR = tuned "cutr" 2               // extra LMR reduction at expected cut nodes
+let private iirDepth = tuned "iirdepth" 4       // IIR: minimum depth to reduce TT-move-less nodes
+let private histLmrDiv = tuned "histlmrdiv" 16384 // history-LMR: r -= history/div (+-2 at |hist| 32K, +-6 at the 100K clamp)
+let private nmpEvalDiv = tuned "nmpevaldiv" 200 // NMP: extra reduction per (eval-beta)/div
+let private nmpEvalMax = tuned "nmpevalmax" 2   // NMP: cap on the eval-based extra reduction
+let private nmpVerifyDepth = tuned "nmpverify" 12 // NMP: verification search from this depth
+let private sext2Margin = tuned "sext2margin" 20  // double extension: singular by this extra margin
+let private seeCMargin = tuned "seecmargin" 160 // SEE capture pruning: cp lost per depth
+let private seeCDepth = tuned "seecdepth" 6     // SEE capture pruning maximum depth
+let private razorMargin = tuned "razormargin" 240 // razoring: eval deficit per depth
+let private razorDepth = tuned "razordepth" 2     // razoring maximum depth
+// gravity rescales History/ContHist to |h| <= cap; if combined with histlmr,
+// retune histlmrdiv accordingly (~cap/8)
+let private gravityCap = tuned "gravitycap" 32768
+let private tmStabMin = tuned "tmstabmin" 12    // stable best move: soft budget x min/16
+let private tmStabMax = tuned "tmstabmax" 24    // unstable best move: soft budget x max/16
 
 // log-based late-move-reduction table
 let private lmrTable =
@@ -213,8 +251,20 @@ let inline private captIdx (pos: Position) (m: Move) =
         else pieceType pos.Mailbox.[moveTo m]
     (pos.Mailbox.[moveFrom m] * 64 + moveTo m) * 6 + victim
 
+/// History/ContHist update: additive with hard clamp (baseline) or gravity
+/// (histgravity): h += b - h*|b|/cap, self-limiting to |h| <= gravityCap and
+/// decaying stale signals instead of saturating at the rails.
+let inline private bumpHist (arr: int[]) (idx: int) (bonus: int) =
+    if useHistGravity then
+        arr.[idx] <- arr.[idx] + bonus - arr.[idx] * abs bonus / gravityCap
+    else
+        arr.[idx] <- max -100_000 (min 100_000 (arr.[idx] + bonus))
+
 let inline private bumpCapt (st: State) (idx: int) (delta: int) =
-    st.CaptHist.[idx] <- max -8192 (min 8192 (st.CaptHist.[idx] + delta))
+    if useHistGravity then
+        st.CaptHist.[idx] <- st.CaptHist.[idx] + delta - st.CaptHist.[idx] * abs delta / 8192
+    else
+        st.CaptHist.[idx] <- max -8192 (min 8192 (st.CaptHist.[idx] + delta))
 
 // ---- correction history: static eval bias per (stm, pawn structure) ----
 let inline private corrIndex (pos: Position) =
@@ -228,7 +278,7 @@ let inline private correctedEval (pos: Position) (st: State) (raw: int) =
         if c > bound then bound elif c < -bound then -bound else c
 
 /// Ordering score for one move (shared by eager and staged generation paths)
-let inline private moveScore (pos: Position) (st: State) (ttMove: Move) (k0: Move) (k1: Move) (ply: int) (m: Move) =
+let inline private moveScore (pos: Position) (st: State) (ttMove: Move) (k0: Move) (k1: Move) (cm: Move) (ply: int) (m: Move) =
     if m = ttMove then 1_000_000
     elif isCapture pos m then
         let victim =
@@ -246,7 +296,22 @@ let inline private moveScore (pos: Position) (st: State) (ttMove: Move) (k0: Mov
     elif moveFlag m = FlagPromo then 90_000 + movePromo m
     elif m = k0 then 80_000
     elif m = k1 then 79_999
+    elif m = cm then 79_998   // countermove: refuted the previous move before
     else quietScore pos st m ply
+
+/// Raw NNUE eval with a per-thread position-keyed cache (evalcache, opt-in).
+/// Caches the RAW eval only — corrhist correction evolves during search and
+/// must be applied fresh. Stale entries are impossible: keyed by full zobrist.
+let inline private cachedEval (pos: Position) (st: State) =
+    if not useEvalCache then evaluate pos
+    else
+        let slot = int (pos.Key &&& 131071UL)
+        if st.EvalKeys.[slot] = pos.Key then st.EvalVals.[slot]
+        else
+            let v = evaluate pos
+            st.EvalKeys.[slot] <- pos.Key
+            st.EvalVals.[slot] <- v
+            v
 
 let inline private pickNext (moves: Move[]) (scores: int[]) (i: int) (n: int) =
     let mutable bi = i
@@ -258,6 +323,7 @@ let inline private pickNext (moves: Move[]) (scores: int[]) (i: int) (n: int) =
 
 let rec qsearch (pos: Position) (st: State) (alphaIn: int) (beta: int) (ply: int) (checksLeft: int) : int =
     st.Nodes <- st.Nodes + 1UL
+    if ply > st.SelDepth then st.SelDepth <- ply
     checkUp st
     if st.Stop.Value then 0
     elif ply >= MaxPly - 1 then evaluate pos
@@ -280,7 +346,7 @@ let rec qsearch (pos: Position) (st: State) (alphaIn: int) (beta: int) (ply: int
         else
         let inChk = inCheck pos
         let mutable alpha = alphaIn
-        let standPat = if inChk then -Infinity else correctedEval pos st (evaluate pos)
+        let standPat = if inChk then -Infinity else correctedEval pos st (cachedEval pos st)
         if not inChk && standPat >= beta then standPat
         else
             if standPat > alpha then alpha <- standPat
@@ -379,6 +445,7 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
     if depthIn <= 0 then qsearch pos st alphaIn betaIn ply (if useQsChecks then 1 else 0)
     else
         st.Nodes <- st.Nodes + 1UL
+        if ply > st.SelDepth then st.SelDepth <- ply
         checkUp st
         let isRoot = ply = 0
         if st.Stop.Value then 0
@@ -393,9 +460,16 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
             let ttMove =
                 if tte.Hit && tte.Move <> NoMove && isPseudoLegal pos tte.Move then tte.Move
                 else NoMove
+            // mate-distance pruning: no line from here can beat an already-found
+            // shorter mate — clamp the window and cut when it empties
+            if useMdp && not isRoot then
+                alpha <- max alpha (ply - MateValue)
+            let beta = if useMdp && not isRoot then min beta (MateValue - ply - 1) else beta
             // TT cutoff (never inside an exclusion search)
             let mutable ttCut = System.Int32.MinValue
-            if not isRoot && excluded = NoMove && tte.Hit && tte.Depth >= depthIn then
+            if useMdp && not isRoot && alpha >= beta then ttCut <- alpha
+            if ttCut = System.Int32.MinValue
+               && not isRoot && excluded = NoMove && tte.Hit && tte.Depth >= depthIn then
                 let s = scoreFromTt tte.Score ply
                 if tte.Bound = BoundExact then ttCut <- s
                 elif tte.Bound = BoundLower && s >= beta then ttCut <- s
@@ -403,8 +477,15 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
             if ttCut <> System.Int32.MinValue then ttCut
             else
                 let inChk = inCheck pos
-                let depth = if inChk then depthIn + 1 else depthIn   // check extension
-                let rawEval = if inChk then -Infinity else evaluate pos
+                let depthChk = if inChk then depthIn + 1 else depthIn   // check extension
+                // IIR: without a TT move the first pass mostly discovers ordering;
+                // a shallower pass is cheaper and the TT carries it to the re-visit
+                let depth =
+                    if useIir && depthChk >= iirDepth && ttMove = NoMove
+                       && not isRoot && excluded = NoMove
+                    then depthChk - 1
+                    else depthChk
+                let rawEval = if inChk then -Infinity else cachedEval pos st
                 let staticEval = if inChk then -Infinity else correctedEval pos st rawEval
                 // improving: static eval trend vs two plies ago (unknown => true)
                 st.EvalStack.[ply] <- if inChk then System.Int32.MinValue else staticEval
@@ -419,18 +500,35 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                 if not inChk && not isRoot && depth <= 8
                    && not (isMateScore beta) && staticEval - 80 * rfpDepth >= beta then
                     earlyCut <- staticEval
+                // razoring: hopeless frontier eval — verify with qsearch and bail
+                if useRazor && earlyCut = System.Int32.MinValue
+                   && not inChk && not isRoot && excluded = NoMove
+                   && depth <= razorDepth
+                   && not (isMateScore alpha)
+                   && staticEval + razorMargin * depth <= alpha then
+                    let v = qsearch pos st alpha (alpha + 1) ply (if useQsChecks then 1 else 0)
+                    if not st.Stop.Value && v <= alpha then earlyCut <- v
                 // null-move pruning
                 if earlyCut = System.Int32.MinValue
                    && nullOk && excluded = NoMove && not inChk && not isRoot && depth >= 3
                    && not (isMateScore beta) && hasNonPawnMaterial pos
                    && staticEval >= beta then
-                    let r = 2 + depth / 6
+                    let r =
+                        2 + depth / 6
+                        + (if useNmp2 then max 0 (min nmpEvalMax ((staticEval - beta) / nmpEvalDiv)) else 0)
                     st.ContIdx.[ply + 1] <- -1
                     makeNull pos
                     let v = -searchEx pos st (depth - 1 - r) (ply + 1) (-beta) (-beta + 1) false (not cutNode) NoMove
                     unmakeNull pos
                     if not st.Stop.Value && v >= beta then
-                        earlyCut <- if isMateScore v then beta else v
+                        // nmp2: at high depth, confirm the null observation with a
+                        // reduced real search before cutting (zugzwang guard)
+                        if useNmp2 && depth >= nmpVerifyDepth then
+                            let vv = searchEx pos st (depth - 1 - r) ply (beta - 1) beta false cutNode NoMove
+                            if not st.Stop.Value && vv >= beta then
+                                earlyCut <- if isMateScore v then beta else v
+                        else
+                            earlyCut <- if isMateScore v then beta else v
                 // probcut: a good capture beating beta by a margin at reduced depth
                 if useProbcut && earlyCut = System.Int32.MinValue
                    && not isRoot && excluded = NoMove && not inChk && depth >= pcDepthGate
@@ -467,8 +565,13 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                         let sBeta = scoreFromTt tte.Score ply - sBetaMult * depth
                         let v = searchEx pos st ((depth - 1) / 2) ply (sBeta - 1) sBeta false cutNode ttMove
                         if not st.Stop.Value then
-                            if v < sBeta then singularExt <- 1          // TT move is singular: extend
+                            if v < sBeta then
+                                // sext2: decisively singular on a non-PV node — extend by two
+                                singularExt <-
+                                    if useSext2 && betaIn - alphaIn <= 1 && v < sBeta - sext2Margin
+                                    then 2 else 1
                             elif sBeta >= beta then mcCut <- sBeta      // multicut: several moves beat beta
+                            elif useSext2 && cutNode then singularExt <- -1   // not singular here: spend less
                     if st.Stop.Value then 0
                     elif mcCut <> System.Int32.MinValue then mcCut
                     else
@@ -481,6 +584,10 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                         let triedC = st.TriedCapts.[ply]
                         let k0 = st.Killers.[ply * 2]
                         let k1 = st.Killers.[ply * 2 + 1]
+                        let cm =
+                            if useCounterMove && st.ContIdx.[ply] >= 0
+                            then st.CounterMove.[st.ContIdx.[ply]]
+                            else NoMove
                         // staged: search the validated TT move BEFORE generating anything;
                         // a stage-0 cutoff skips movegen+scoring+sorting entirely. The TT
                         // move is pseudo-legal-checked, so playing it ungated is safe, and
@@ -496,7 +603,7 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                             else
                                 let cnt = generate pos moves
                                 for idx in 0 .. cnt - 1 do
-                                    scores.[idx] <- moveScore pos st ttMove k0 k1 ply moves.[idx]
+                                    scores.[idx] <- moveScore pos st ttMove k0 k1 cm ply moves.[idx]
                                 cnt
                         let futilityOk =
                             not inChk && not isRoot && depth <= 6
@@ -520,7 +627,7 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                     let mv = scratch.[j]
                                     if mv <> ttMove then
                                         moves.[k] <- mv
-                                        scores.[k] <- moveScore pos st ttMove k0 k1 ply mv
+                                        scores.[k] <- moveScore pos st ttMove k0 k1 cm ply mv
                                         k <- k + 1
                                 n <- k
                                 generated <- true
@@ -550,17 +657,36 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                     && legalCount > 0
                                     && not (isMateScore alpha)
                                     && not (seeGe pos m (-(seeQMargin * depth)))
+                                // seecapt: skip clearly losing captures at shallow depth.
+                                // mScore < 100_000 = ordering already proved SEE < 0, so
+                                // only known-bad captures pay the second, thresholded SEE
+                                let seeCapSkip =
+                                    useSeeCapt && isCap && not inChk && not isRoot
+                                    && depth <= seeCDepth
+                                    && legalCount > 0
+                                    && mScore < 100_000
+                                    && not (isMateScore alpha)
+                                    && not (seeGe pos m (-(seeCMargin * depth)))
                                 let skipMove =
                                     m = excluded
+                                    || (isRoot && st.RootFilter.Length > 0
+                                        && not (Array.contains m st.RootFilter))
                                     || (futilityOk && quiet && legalCount > 0)
                                     || lmpSkip
                                     || seeSkip
+                                    || seeCapSkip
                                 if not skipMove then
                                     st.ContIdx.[ply + 1] <- moveContIdx pos m
                                     makeMove pos m
+                                    // overlap the child's TT line fetch with legality + recursion setup
+                                    if useTtPrefetch then st.Tt.Prefetch pos.Key
                                     if not (wasLegal pos) then unmakeMove pos m
                                     else
                                         legalCount <- legalCount + 1
+                                        // GUIs show root progress on long iterations
+                                        if isRoot && st.ReportRoot && st.Sw.ElapsedMilliseconds >= 3000L then
+                                            printfn "info depth %d currmove %s currmovenumber %d"
+                                                depth (moveToUci m) legalCount
                                         if quiet && triedQuiets < 128 then
                                             tried.[triedQuiets] <- m
                                             triedQuiets <- triedQuiets + 1
@@ -577,7 +703,15 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                                 if quiet && depth >= 3 && legalCount > 3 && not inChk then
                                                     r <- lmrTable.[min depth 63, min legalCount 63]
                                                     if mScore >= 79_999 then r <- r - 1   // killers
+                                                    if useHistLmr then
+                                                        r <- r - st.History.[historyIndex pos m] / histLmrDiv
                                                     if useCutLmr && cutNode then r <- r + cutR
+                                                    if r > newDepth - 1 then r <- newDepth - 1
+                                                    if r < 0 then r <- 0
+                                                elif useCaptLmr && isCap && mScore < 100_000
+                                                     && depth >= 3 && legalCount > 3 && not inChk then
+                                                    // bad captures (ordering proved SEE < 0): half reduction
+                                                    r <- lmrTable.[min depth 63, min legalCount 63] / 2
                                                     if r > newDepth - 1 then r <- newDepth - 1
                                                     if r < 0 then r <- 0
                                                 let mutable v' = -searchEx pos st (newDepth - r) (ply + 1) (-alpha - 1) (-alpha) true true NoMove
@@ -612,20 +746,18 @@ let rec searchEx (pos: Position) (st: State) (depthIn: int) (ply: int) (alphaIn:
                                                     if m <> k0 then
                                                         st.Killers.[ply * 2 + 1] <- k0
                                                         st.Killers.[ply * 2] <- m
+                                                    if useCounterMove && st.ContIdx.[ply] >= 0 then
+                                                        st.CounterMove.[st.ContIdx.[ply]] <- m
                                                     let bonus = depth * depth
                                                     let prev = if useContHist then st.ContIdx.[ply] else -1
-                                                    let hIdx = historyIndex pos m
-                                                    st.History.[hIdx] <- min 100_000 (st.History.[hIdx] + bonus)
+                                                    bumpHist st.History (historyIndex pos m) bonus
                                                     if prev >= 0 then
-                                                        let cIdx = prev * 768 + moveContIdx pos m
-                                                        st.ContHist.[cIdx] <- min 100_000 (st.ContHist.[cIdx] + bonus)
+                                                        bumpHist st.ContHist (prev * 768 + moveContIdx pos m) bonus
                                                     for q in 0 .. triedQuiets - 1 do
                                                         if tried.[q] <> m then
-                                                            let qIdx = historyIndex pos tried.[q]
-                                                            st.History.[qIdx] <- max -100_000 (st.History.[qIdx] - bonus)
+                                                            bumpHist st.History (historyIndex pos tried.[q]) (-bonus)
                                                             if prev >= 0 then
-                                                                let qc = prev * 768 + moveContIdx pos tried.[q]
-                                                                st.ContHist.[qc] <- max -100_000 (st.ContHist.[qc] - bonus)
+                                                                bumpHist st.ContHist (prev * 768 + moveContIdx pos tried.[q]) (-bonus)
                                                 cut <- true
                                 i <- i + 1
                         if st.Stop.Value then 0
@@ -755,10 +887,22 @@ let think (pos: Position) (st: State) (limits: Limits) (verbose: bool) : Move =
         for h in st.HelperStates do t <- t + h.Nodes
         t
 
+    st.ReportRoot <- verbose
+    st.RootFilter <- limits.SearchMoves
     let mutable lastBest = NoMove
     let mutable prevScore = 0
+    let mutable stability = 0   // consecutive iterations with an unchanged best move
     let mutable depth = 1
     while depth <= maxDepth && not st.Stop.Value do
+        st.SelDepth <- 0
+        // full UCI info line; bound = "" (exact) / " lowerbound" / " upperbound"
+        let report (score: int) (bound: string) =
+            let ms = st.Sw.ElapsedMilliseconds
+            let nodes = totalNodes ()
+            let nps = if ms > 0L then nodes * 1000UL / uint64 ms else 0UL
+            printfn "info depth %d seldepth %d multipv 1 score %s%s%s nodes %d nps %d hashfull %d tbhits 0 time %d pv%s"
+                depth st.SelDepth (scoreString score) (wdlInfoString pos) bound
+                nodes nps (st.Tt.Hashfull()) ms (getPvString pos st 24)
         let mutable delta = 25
         let mutable alpha = if depth >= 5 then max (-Infinity) (prevScore - delta) else -Infinity
         let mutable betaW = if depth >= 5 then min Infinity (prevScore + delta) else Infinity
@@ -768,28 +912,44 @@ let think (pos: Position) (st: State) (limits: Limits) (verbose: bool) : Move =
             score <- search pos st depth 0 alpha betaW true
             if st.Stop.Value then ()
             elif score <= alpha then
+                if verbose then report score " upperbound"
                 betaW <- (alpha + betaW) / 2
                 alpha <- max (-Infinity) (alpha - delta)
                 delta <- delta * 2
             elif score >= betaW then
+                if verbose then report score " lowerbound"
                 betaW <- min Infinity (betaW + delta)
                 delta <- delta * 2
             else settled <- true
         if not st.Stop.Value || lastBest = NoMove then
-            if st.BestMove <> NoMove then lastBest <- st.BestMove
+            if st.BestMove <> NoMove then
+                stability <- if st.BestMove = lastBest then stability + 1 else 0
+                lastBest <- st.BestMove
             prevScore <- score
             if settled then
                 st.BestScore <- score
                 st.CompletedDepth <- depth
-            if verbose && settled then
-                let ms = st.Sw.ElapsedMilliseconds
-                let nodes = totalNodes ()
-                let nps = if ms > 0L then nodes * 1000UL / uint64 ms else 0UL
-                printfn "info depth %d score %s nodes %d nps %d time %d pv%s"
-                    depth (scoreString score) nodes nps ms (getPvString pos st 24)
-        if softMs > 0L && st.Sw.ElapsedMilliseconds * 2L > softMs then
+            if verbose && settled then report score ""
+            // go mate N: a proven mate within range ends the search
+            if limits.MateIn > 0 && settled && score >= MateValue - 2 * limits.MateIn then
+                st.Stop.Value <- true
+        // tmstab: a stable best move needs less of the soft budget, a flapping
+        // one earns more (the hard limit still rules either way)
+        let effSoft =
+            if useTmStab && softMs > 0L then
+                let mul = max tmStabMin (tmStabMax - 3 * stability)
+                softMs * int64 mul / 16L
+            else softMs
+        if effSoft > 0L && st.Sw.ElapsedMilliseconds * 2L > effSoft then
             st.Stop.Value <- true
         depth <- depth + 1
+    if verbose then
+        // final stats line: GUIs read definitive totals from here
+        let ms = st.Sw.ElapsedMilliseconds
+        let nodes = totalNodes ()
+        let nps = if ms > 0L then nodes * 1000UL / uint64 ms else 0UL
+        printfn "info nodes %d nps %d hashfull %d tbhits 0 time %d" nodes nps (st.Tt.Hashfull()) ms
+    st.ReportRoot <- false
 
     if helperThreads.Length > 0 then
         st.Stop.Value <- true

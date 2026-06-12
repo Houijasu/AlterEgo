@@ -48,6 +48,24 @@ let private parseGo (pos: Position) (tokens: string[]) =
         | "winc" -> (if pos.Stm = White then limits <- { limits with IncMs = value i }); i <- i + 1
         | "binc" -> (if pos.Stm = Black then limits <- { limits with IncMs = value i }); i <- i + 1
         | "infinite" -> limits <- { limits with Infinite = true }
+        | "mate" -> limits <- { limits with MateIn = int (value i) }; i <- i + 1
+        | "searchmoves" ->
+            // consume every following token that is a move in this position
+            let buf = Array.zeroCreate<Move> 256
+            let n = generate pos buf
+            let picked = ResizeArray<Move>()
+            let mutable j = i + 1
+            let mutable matching = true
+            while matching && j < tokens.Length do
+                let mutable found = NoMove
+                for k in 0 .. n - 1 do
+                    if moveToUci buf.[k] = tokens.[j] then found <- buf.[k]
+                if found <> NoMove then
+                    picked.Add found
+                    j <- j + 1
+                else matching <- false
+            limits <- { limits with SearchMoves = picked.ToArray() }
+            i <- j - 1
         | _ -> ()
         i <- i + 1
     limits
@@ -68,6 +86,8 @@ let run () =
         st.Stop.Value <- true
         if worker <> null && worker.IsAlive then worker.Join()
 
+    let mutable overheadMs = 30L   // Move Overhead: clock safety for GUI/network latency
+
     let mutable running = netOk
     while running do
         let line = Console.ReadLine()
@@ -85,6 +105,8 @@ let run () =
                     printfn "option name Hash type spin default 64 min 1 max 8192"
                     printfn "option name Threads type spin default 1 min 1 max 256"
                     printfn "option name EvalFile type string default <embedded>"
+                    printfn "option name UCI_ShowWDL type check default false"
+                    printfn "option name Move Overhead type spin default 30 min 0 max 1000"
                     printfn "uciok"
                 | "isready" -> printfn "readyok"
                 | "setoption" ->
@@ -94,7 +116,8 @@ let run () =
                     let valueIdx = Array.tryFindIndex ((=) "value") tokens
                     match nameIdx, valueIdx with
                     | Some ni, Some vi when ni + 1 < tokens.Length && vi + 1 < tokens.Length ->
-                        match tokens.[ni + 1].ToLowerInvariant() with
+                        // option names may span tokens ("Move Overhead") — join them
+                        match String.Join("", tokens.[ni + 1 .. vi - 1]).ToLowerInvariant() with
                         | "hash" ->
                             let mb = max 1 (min 8192 (int tokens.[vi + 1]))
                             st.Tt <- AlterEgo.TT.Table(mb)
@@ -102,6 +125,10 @@ let run () =
                         | "threads" ->
                             st.ThreadCount <- max 1 (min 256 (int tokens.[vi + 1]))
                             AlterEgo.Search.ensureHelpers st
+                        | "uci_showwdl" ->
+                            AlterEgo.Search.showWdl <- tokens.[vi + 1].ToLowerInvariant() = "true"
+                        | "moveoverhead" ->
+                            overheadMs <- int64 (max 0 (min 1000 (int tokens.[vi + 1])))
                         | "evalfile" ->
                             let path = String.Join(" ", tokens.[vi + 1 ..])
                             if AlterEgo.Nnue.load path then
@@ -119,6 +146,8 @@ let run () =
                     Array.Clear(st.CorrHist, 0, st.CorrHist.Length)
                     Array.Clear(st.ContHist, 0, st.ContHist.Length)
                     Array.Clear(st.CaptHist, 0, st.CaptHist.Length)
+                    Array.Clear(st.CounterMove, 0, st.CounterMove.Length)
+                    Array.Clear(st.EvalKeys, 0, st.EvalKeys.Length)
                 | "position" ->
                     stopSearch ()
                     try
@@ -146,12 +175,24 @@ let run () =
                             let mtg = if limits.MovesToGo > 0 then int64 limits.MovesToGo + 1L else 32L
                             limits.TimeMs / mtg + limits.IncMs / 2L
                         else 0L
+                    // Move Overhead: keep GUI/network latency off the clock
+                    let machineBudget = if machineBudget > 0L then max 10L (machineBudget - overheadMs) else 0L
                     worker <- Thread((fun () ->
                         try
                             let bm =
                                 if machineBudget > 0L then AlterEgo.Machine.think pos st machineBudget true
                                 else think pos st limits true
-                            printfn "bestmove %s" (moveToUci bm)
+                            // ponder hint: the TT's reply to our move (best effort)
+                            let mutable ponder = ""
+                            if bm <> NoMove then
+                                makeMove pos bm
+                                let tte = st.Tt.Probe pos.Key
+                                if tte.Hit && tte.Move <> NoMove && isPseudoLegal pos tte.Move then
+                                    makeMove pos tte.Move
+                                    if wasLegal pos then ponder <- " ponder " + moveToUci tte.Move
+                                    unmakeMove pos tte.Move
+                                unmakeMove pos bm
+                            printfn "bestmove %s%s" (moveToUci bm) ponder
                         with ex ->
                             // a crashed search must not kill the engine process
                             logCrash "search worker" ex

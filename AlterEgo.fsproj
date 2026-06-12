@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <Compile Include="src\Types.fs" />
+    <Compile Include="src\SearchConfig.fs" />
     <Compile Include="src\Bitboards.fs" />
     <Compile Include="src\Magics.fs" />
     <Compile Include="src\Zobrist.fs" />

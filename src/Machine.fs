@@ -29,30 +29,10 @@ type Arm =
 // Strictly additive: it can promote a challenger inside the cp band
 // [wdlfloor, switchMargin) but never vetoes a cp-margin switch — per
 // doctrine, a depth-0 probe must not outrank depth-(idDepth-1) evidence.
-let private enabledSet =
-    match System.Environment.GetEnvironmentVariable "ALTEREGO_ENABLE" with
-    | null -> Set.empty
-    | s -> s.Split(',') |> Array.map (fun x -> x.Trim().ToLowerInvariant()) |> Set.ofArray
-
-let private useWdlRoot = enabledSet.Contains "wdlroot"
-
-let private tuned key dflt =
-    match System.Environment.GetEnvironmentVariable "ALTEREGO_TUNE" with
-    | null -> dflt
-    | s ->
-        s.Split(',')
-        |> Array.tryPick (fun kv ->
-            match kv.Split('=') with
-            | [| k; v |] when k.Trim().ToLowerInvariant() = key ->
-                match System.Int32.TryParse(v.Trim()) with
-                | true, n -> Some n
-                | _ -> None
-            | _ -> None)
-        |> Option.defaultValue dflt
-
-let private wdlGamma = float32 (tuned "wdlgamma" 500) / 1000.0f   // draw weight in utility (500 = expected score)
-let private wdlMargin = float32 (tuned "wdlmargin" 25) / 1000.0f  // utility switch margin (~20cp near equality)
-let private wdlFloor = tuned "wdlfloor" 0                         // challenger must not be cp-worse than this
+let private useWdlRoot = SearchConfig.optIn "wdlroot"
+let private wdlGamma = float32 (SearchConfig.tuned "wdlgamma" 500) / 1000.0f   // draw weight in utility (500 = expected score)
+let private wdlMargin = float32 (SearchConfig.tuned "wdlmargin" 25) / 1000.0f  // utility switch margin (~20cp near equality)
+let private wdlFloor = SearchConfig.tuned "wdlfloor" 0                         // challenger must not be cp-worse than this
 
 let private probeAt (pos: Position) (st: State) (arm: Arm) (d: int) =
     st.ContIdx.[1] <- pos.Mailbox.[moveFrom arm.Move] * 64 + moveTo arm.Move
@@ -82,7 +62,8 @@ let think (pos: Position) (st: State) (budgetMs: int64) (verbose: bool) : Move =
         // ---- Phase 1: the seed gets the FULL budget (identical to raw Ego) ----
         // The Ego's soft-stop ends early rather than start an unfinishable depth;
         // Phase 2 runs purely on that leftover time — verification is free.
-        let idMove = AlterEgo.Search.think pos st { defaultLimits with MoveTimeMs = budgetMs } false
+        // verbose passes through: GUIs see live per-depth lines during timed play
+        let idMove = AlterEgo.Search.think pos st { defaultLimits with MoveTimeMs = budgetMs } verbose
         let idScore = st.BestScore
         let idDepth = st.CompletedDepth
         let seedNodes = st.Nodes
@@ -216,8 +197,9 @@ let think (pos: Position) (st: State) (budgetMs: int64) (verbose: bool) : Move =
                 let ms = max 1L swTotal.ElapsedMilliseconds
                 let mutable nodes = st.Nodes
                 for h in st.HelperStates do nodes <- nodes + h.Nodes
-                printfn "info depth %d score cp %d nodes %d nps %d time %d pv %s"
-                    chosen.Depth chosen.Cp nodes (nodes * 1000UL / uint64 ms) ms (moveToUci chosen.Move)
+                printfn "info depth %d score cp %d%s nodes %d nps %d time %d pv %s"
+                    chosen.Depth chosen.Cp (AlterEgo.Search.wdlInfoString pos)
+                    nodes (nodes * 1000UL / uint64 ms) ms (moveToUci chosen.Move)
                 printfn "info string machine verdict %s depth %d cp %d (seed %s d%d cp %d) contenders %d"
                     (moveToUci chosen.Move) chosen.Depth chosen.Cp
                     (moveToUci idMove) idDepth idScore

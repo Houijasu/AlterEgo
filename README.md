@@ -63,10 +63,14 @@ AlterEgo exposes these UCI options:
 | `Hash` | spin | `64` | `1..8192` | Transposition table size in MB. |
 | `Threads` | spin | `1` | `1..256` | Search threads, including helper threads. |
 | `EvalFile` | string | `<embedded>` | n/a | Optional NNUE file path. Uses embedded `default.nnue` by default. |
+| `UCI_ShowWDL` | check | `false` | n/a | Append calibrated `wdl <w> <d> <l>` (per mille) to info lines. |
+| `Move Overhead` | spin | `30` | `0..1000` | Per-move clock safety margin for GUI/network latency (ms). |
 
 Clocked UCI searches such as `go movetime`, `go wtime`, and `go btime` use the
 `MACHINE` timed-search layer. Budgetless searches such as `go depth`,
 `go nodes`, and `go infinite` run the Ego alpha-beta core directly.
+`go searchmoves <moves>` restricts the root, and `go mate <n>` stops once a
+mate within `n` moves is proven.
 
 ## Commands
 
@@ -85,7 +89,7 @@ All commands below are run through `dotnet run -c Release -- ...`.
 | `match <games> <ms> [lanes]` | Run `MACHINE` vs Ego self-play matches. |
 | `datagen <games> <nodes> <out> [net] [lanes]` | Generate binary self-play samples. |
 | `pgnconv <pgn> <out> [nodes] [lanes]` | Convert PGN games into labeled binary training samples. |
-| `train <data> <epochs> <out> [kingBuckets]` | Train and export an NNUE file. |
+| `train <data> <epochs> <out> [kingBuckets]` | Train and export an NNUE file. `<data>` accepts `+`-joined paths; corpora beyond 2GB stream through 1GB slabs. |
 | `scrub <in> <out>` | Recover valid 100-byte records from interrupted datagen output. |
 | `evalcheck <net>` | Print NNUE scores for reference positions. |
 | `nnuetest <net>` | Verify incremental NNUE accumulators against full rebuilds. |
@@ -146,6 +150,9 @@ Search experiments can be controlled with environment variables:
 | Variable | Example | Purpose |
 |---|---|---|
 | `ALTEREGO_ENABLE` | `probcut,corrhist,wdlroot` | Opt in to experimental features. |
+
+Pending experiments run through `scripts\sprt-queue.ps1`, which plays solo
+matched-net A/B gauntlets per flag and logs verdicts to `docs\EVIDENCE.md`.
 | `ALTEREGO_DISABLE` | `lmp,improving` | Disable promoted features for A/B runs. |
 | `ALTEREGO_TUNE` | `lmpbase=2,sbetamult=3` | Override tuning constants for sweeps. |
 
