@@ -2,8 +2,8 @@
 
 AlterEgo is a UCI chess engine written in F#. It combines a conventional
 alpha-beta search core with an embedded NNUE evaluator, perft tooling, self-play
-data generation, NNUE training, and match harnesses for engine-vs-engine
-experiments.
+and PGN-based data generation, NNUE training, and match harnesses for
+engine-vs-engine experiments.
 
 The engine starts in UCI mode by default and identifies itself as
 `AlterEgo 0.3`.
@@ -15,9 +15,10 @@ The engine starts in UCI mode by default and identifies itself as
 - Perft and divide commands for move-generation verification.
 - Iterative deepening alpha-beta search with transposition table, move ordering,
   pruning, quiescence search, and lazy SMP helper threads.
-- Embedded `default.nnue` network with PST evaluation fallback.
+- Embedded `default.nnue` network; the engine is NNUE-only and refuses to
+  search without a loaded network.
 - `MACHINE` timed-search layer for root verification over the Ego search core.
-- Self-play data generation and in-repo NNUE trainer.
+- Self-play and PGN-to-sample data generation with an in-repo NNUE trainer.
 - In-process A/B match runner and external UCI gauntlet support.
 
 ## Requirements
@@ -82,11 +83,11 @@ All commands below are run through `dotnet run -c Release -- ...`.
 | `bench [depth]` | Search benchmark over the built-in position suite. Default depth is 9. |
 | `machine <ms> ["<fen>"]` | Run one timed `MACHINE` search and print `bestmove`. |
 | `match <games> <ms> [lanes]` | Run `MACHINE` vs Ego self-play matches. |
-| `matchnnue <games> <ms> <net> [lanes]` | Run NNUE Ego vs PST Ego matches. |
 | `datagen <games> <nodes> <out> [net] [lanes]` | Generate binary self-play samples. |
+| `pgnconv <pgn> <out> [nodes] [lanes]` | Convert PGN games into labeled binary training samples. |
 | `train <data> <epochs> <out> [kingBuckets]` | Train and export an NNUE file. |
 | `scrub <in> <out>` | Recover valid 100-byte records from interrupted datagen output. |
-| `evalcheck <net>` | Compare NNUE and PST scores on reference positions. |
+| `evalcheck <net>` | Print NNUE scores for reference positions. |
 | `nnuetest <net>` | Verify incremental NNUE accumulators against full rebuilds. |
 | `cage <games> <ms> <net> <engine> [elo] [lanes]` | Run a gauntlet against an external UCI engine. |
 
@@ -98,17 +99,20 @@ dotnet run -c Release -- bench 9
 dotnet run -c Release -- perft 5
 dotnet run -c Release -- machine 1000
 dotnet run -c Release -- datagen 1000 10000 data\samples.bin default.nnue 8
+dotnet run -c Release -- pgnconv data\games.pgn data\pgn-samples.bin 8000 8
 dotnet run -c Release -- train data\samples.bin 12 data\net.nnue 4
 dotnet run -c Release -- cage 64 500 default.nnue tools\stockfish.exe 2900 8
 ```
 
 ## Verification
 
-There is no separate test project in this repository. The main verification
+Unit tests live in `tests/AlterEgo.Tests.fsproj` and run with `dotnet test`
+(the solution file wires them in from the repo root). The main verification
 commands are:
 
 ```powershell
 dotnet build -c Release
+dotnet test -c Release
 dotnet run -c Release -- suite
 dotnet run -c Release -- bench 9
 dotnet run -c Release -- nnuetest default.nnue
@@ -118,12 +122,18 @@ Use `suite deep` for a slower perft check.
 
 ## Training Data
 
-Datagen writes fixed-size binary records. Each record is 100 bytes:
+`datagen` and `pgnconv` write the same fixed-size binary records. Each record
+is 100 bytes:
 
 - `12 x uint64` bitboards.
 - Side-to-move byte.
 - White-perspective centipawn score as `int16`.
 - White-perspective result as `sbyte` (`-1`, `0`, or `1`).
+
+`datagen` appends self-play samples to the output file. `pgnconv` creates a
+fresh output file from PGN games, skips TCEC-style book moves when marked in
+comments, labels quiet positions with a fixed-node search, and drops unfinished
+games without a result.
 
 Generated data, trained networks, logs, and external engines are intentionally
 ignored by Git. Keep them under `data/` and `tools/` unless you intentionally
@@ -135,7 +145,7 @@ Search experiments can be controlled with environment variables:
 
 | Variable | Example | Purpose |
 |---|---|---|
-| `ALTEREGO_ENABLE` | `probcut,corrhist` | Opt in to experimental features. |
+| `ALTEREGO_ENABLE` | `probcut,corrhist,wdlroot` | Opt in to experimental features. |
 | `ALTEREGO_DISABLE` | `lmp,improving` | Disable promoted features for A/B runs. |
 | `ALTEREGO_TUNE` | `lmpbase=2,sbetamult=3` | Override tuning constants for sweeps. |
 
@@ -152,21 +162,26 @@ Remove-Item Env:\ALTEREGO_DISABLE
 ```text
 .
 |-- AlterEgo.fsproj       F# project file
+|-- AlterEgo.slnx         Solution including engine and tests
 |-- Program.fs            CLI dispatcher and entry point
 |-- default.nnue          Embedded default evaluation network
 |-- docs/
 |   |-- MACHINE.md        Search architecture notes
 |   `-- LADDER.md         Strength measurement notes
-`-- src/
+|-- src/
     |-- Arena.fs          Match and gauntlet harness
     |-- Datagen.fs        Self-play sample generation
     |-- Machine.fs        Timed MACHINE search layer
     |-- MoveGen.fs        Legal move generation
     |-- Nnue.fs           NNUE load, save, and inference
+    |-- Pgn.fs            PGN-to-training-sample converter
     |-- Search.fs         Alpha-beta search core
     |-- Train.fs          NNUE trainer
     |-- Uci.fs            UCI protocol loop
     `-- ...
+`-- tests/
+    |-- AlterEgo.Tests.fsproj
+    `-- Tests.fs
 ```
 
 ## Documentation
