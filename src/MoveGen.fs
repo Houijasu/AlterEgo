@@ -5,6 +5,17 @@ open AlterEgo.Bitboards
 open AlterEgo.Magics
 open AlterEgo.Position
 
+/// A FEN can carry a bogus ep square (makeMove only ever sets real ones).
+/// Only trust it when it is on the legal rank, the target square is empty,
+/// and the double-pushed enemy pawn is actually present — otherwise an ep
+/// capture would remove a phantom pawn and corrupt the board.
+let inline private epValid (pos: Position) (occ: uint64) =
+    (if pos.Stm = White then pos.Ep >= 40 && pos.Ep <= 47
+     else pos.Ep >= 16 && pos.Ep <= 23)
+    && occ &&& bit pos.Ep = 0UL
+    && pos.ByPiece.[(pos.Stm ^^^ 1) * 6 + Pawn]
+       &&& bit (if pos.Stm = White then pos.Ep - 8 else pos.Ep + 8) <> 0UL
+
 /// Generate pseudo-legal moves into `moves`, returning the count.
 /// Castling is fully legality-checked here; everything else is filtered by
 /// make + king-safety check at the call site.
@@ -74,7 +85,7 @@ let generate (pos: Position) (moves: Move[]) : int =
             if t <= 7 then pushPromos (t + 9) t else push (mkMove (t + 9) t)
 
     // en passant
-    if pos.Ep >= 0 then
+    if pos.Ep >= 0 && epValid pos occ then
         let mutable srcs = pawnAttacks.[them].[pos.Ep] &&& pos.ByPiece.[us * 6 + Pawn]
         while srcs <> 0UL do
             let s = lsb srcs
@@ -221,6 +232,7 @@ let isPseudoLegal (pos: Position) (m: Move) : bool =
                 pt = Pawn
                 && pos.Ep >= 0
                 && toSq = pos.Ep
+                && epValid pos occ
                 && pawnAttacks.[us ^^^ 1].[pos.Ep] &&& bit fromSq <> 0UL
             | FlagPromo ->
                 if pt <> Pawn then false
@@ -307,7 +319,7 @@ let generateCaptures (pos: Position) (moves: Move[]) : int =
             capR <- capR &&& (capR - 1UL)
             if t <= 7 then push (mkMoveF (t + 9) t FlagPromo 3) else push (mkMove (t + 9) t)
 
-    if pos.Ep >= 0 then
+    if pos.Ep >= 0 && epValid pos occ then
         let mutable srcs = pawnAttacks.[them].[pos.Ep] &&& pos.ByPiece.[us * 6 + Pawn]
         while srcs <> 0UL do
             let s = lsb srcs
